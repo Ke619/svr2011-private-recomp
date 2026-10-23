@@ -49,11 +49,49 @@ jobs:
         run: |
           git -C sdk apply --whitespace=nowarn ../port-src/port/patches/rexglue-sdk-svr2011.patch
           git -C plume apply --whitespace=nowarn ../port-src/port/patches/plume-svr2011.patch
+
+          # SDK: MoltenVK has no AppKit on iOS; thread id; no mach_vm.h on iOS
           perl -i -pe 's/^(\s*find_library\(APPKIT_LIBRARY.*)$/if(NOT IOS)\n$1\nendif()/' sdk/thirdparty/moltenvk/Common/CMakeLists.txt
           perl -i -pe 's/return pthread_gettid_np\(thread_\);/return [&]{ uint64_t t__ = 0; pthread_threadid_np(thread_, &t__); return static_cast<pid_t>(t__); }();/' sdk/src/core/threading_posix.cpp
+          cat > sdk/src/core/ios_mach_vm_shim.h <<'EOF'
+          // iOS: the SDK has no mach/mach_vm.h; vm_region_64 does the same job.
+          #pragma once
+          #include <mach/mach.h>
+          #include <mach/mach_init.h>
+          #include <mach/vm_map.h>
+          #include <mach/vm_region.h>
+          static inline kern_return_t mach_vm_region(vm_map_t task, mach_vm_address_t* address,
+                                                     mach_vm_size_t* size, vm_region_flavor_t flavor,
+                                                     vm_region_info_t info, mach_msg_type_number_t* count,
+                                                     mach_port_t* object_name) {
+            vm_address_t a = static_cast<vm_address_t>(*address);
+            vm_size_t s = 0;
+            kern_return_t kr = vm_region_64(task, &a, &s, flavor, info, count, object_name);
+            *address = a;
+            *size = s;
+            return kr;
+          }
+          EOF
+          perl -i -pe 's{#\s*include\s*[<"]mach/mach_vm\.h[>"]}{#include "ios_mach_vm_shim.h"}' sdk/src/core/memory_posix.cpp
+          echo "---- mach_vm.h users in the SDK (should only be the shim now) ----"
+          grep -rn "mach_vm.h\|ios_mach_vm_shim" sdk/src sdk/include | head
+
+          # plume: no Metal backend on iOS (Vulkan only)
           perl -0pi -e 's/if\(APPLE\)\n(\s+list\(APPEND PLUME_SOURCES\n\s+plume_metal\.cpp)/if(APPLE AND NOT IOS)\n$1/' plume/CMakeLists.txt
+
+          # port: ObjC languages, the launcher/ Bink + include dir on iOS, gettid on Apple
           sed -i '' 's/^project(svr2011 LANGUAGES C CXX)/project(svr2011 LANGUAGES C CXX OBJC OBJCXX)/' port-src/port/CMakeLists.txt
-          grep -n "^project" port-src/port/CMakeLists.txt
+          sed -i '' 's/^if(WIN32 OR ANDROID)$/if(WIN32 OR ANDROID OR IOS)/' port-src/port/CMakeLists.txt
+          cat >> port-src/port/src/compat.h <<'EOF'
+
+          #if defined(__APPLE__) && defined(__cplusplus)
+          #include <pthread.h>
+          #include <sys/types.h>
+          #include <cstdint>
+          inline pid_t gettid() { uint64_t t = 0; pthread_threadid_np(nullptr, &t); return static_cast<pid_t>(t); }
+          #endif
+          EOF
+          grep -n "^project\|WIN32 OR ANDROID" port-src/port/CMakeLists.txt
 
       - name: Put the generated code in place, and stop codegen re-running
         run: |
