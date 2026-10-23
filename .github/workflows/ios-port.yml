@@ -107,6 +107,29 @@ jobs:
           cat > port-src/port/src/ios_stubs.cpp <<'EOF'
           // iOS: no user music / host sound player yet. No-ops so the game links.
           #include "music.h"
+          #include <cstdio>
+          #include <cstdlib>
+          #include <ctime>
+          #include <string>
+          #include <sys/stat.h>
+
+          // iOS boot log: before main() runs, send stdout/stderr to Documents/boot.log so a
+          // startup failure leaves text behind (works from any sideload method).
+          namespace {
+          __attribute__((constructor)) void IosBootLog() {
+            const char* home = std::getenv("HOME");
+            if (!home) return;
+            std::string dir = std::string(home) + "/Documents";
+            mkdir(dir.c_str(), 0755);
+            std::string file = dir + "/boot.log";
+            if (!freopen(file.c_str(), "a", stderr)) return;
+            freopen(file.c_str(), "a", stdout);
+            setvbuf(stderr, nullptr, _IONBF, 0);
+            setvbuf(stdout, nullptr, _IOLBF, 0);
+            std::fprintf(stderr, "[boot] started t=%ld home=%s\n", static_cast<long>(std::time(nullptr)), home);
+            std::atexit([] { std::fprintf(stderr, "[boot] process exit\n"); });
+          }
+          }  // namespace
           namespace svr2011 {
           std::vector<std::filesystem::path> UserMusicSongs() { return {}; }
           void SetSongGain(const std::filesystem::path&, float) {}
