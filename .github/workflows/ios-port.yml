@@ -1,0 +1,113 @@
+name: ios-port
+# Builds the port (generated game code + port/src) for iOS arm64. Lives in the PRIVATE repo.
+on:
+  workflow_dispatch: {}
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+  CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
+
+jobs:
+  port:
+    runs-on: macos-15
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the generated code is here (and no game file)
+        run: |
+          test -f generated/rexglue.cmake && echo "rexglue.cmake ok"
+          test -f generated/default/sources.cmake && echo "sources.cmake ok"
+          test -f generated/default/svr2011_pch.h && echo "pch ok"
+          echo "files in generated: $(find generated -type f | wc -l)"
+          if find . -name "default.xex" | grep -q .; then echo "ERROR: default.xex is in this repo"; exit 1; fi
+
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
+
+      - name: Tools
+        run: brew install ninja ccache || true
+
+      - name: Fetch SDK (pinned), the port, and plume (pinned)
+        run: |
+          git clone https://github.com/rexglue/rexglue-sdk sdk
+          git -C sdk checkout c94f5ebdcb3c9d1a460ca48e04f9758448f8d518
+          git -C sdk submodule update --init --recursive --jobs 8
+          git clone --depth 1 https://github.com/KaikoClanworth1/wwe-svr2011-pc port-src
+          git clone https://github.com/renderbag/plume plume
+          git -C plume checkout d723793
+          git -C plume submodule update --init --recursive --jobs 8
+
+      - name: Apply patches (the port's own, plus our iOS fixes)
+        run: |
+          git -C sdk apply --whitespace=nowarn ../port-src/port/patches/rexglue-sdk-svr2011.patch
+          git -C plume apply --whitespace=nowarn ../port-src/port/patches/plume-svr2011.patch
+          perl -i -pe 's/^(\s*find_library\(APPKIT_LIBRARY.*)$/if(NOT IOS)\n$1\nendif()/' sdk/thirdparty/moltenvk/Common/CMakeLists.txt
+          perl -i -pe 's/return pthread_gettid_np\(thread_\);/return [&]{ uint64_t t__ = 0; pthread_threadid_np(thread_, &t__); return static_cast<pid_t>(t__); }();/' sdk/src/core/threading_posix.cpp
+          perl -0pi -e 's/if\(APPLE\)\n(\s+list\(APPEND PLUME_SOURCES\n\s+plume_metal\.cpp)/if(APPLE AND NOT IOS)\n$1/' plume/CMakeLists.txt
+          sed -i '' 's/^project(svr2011 LANGUAGES C CXX)/project(svr2011 LANGUAGES C CXX OBJC OBJCXX)/' port-src/port/CMakeLists.txt
+          grep -n "^project" port-src/port/CMakeLists.txt
+
+      - name: Put the generated code in place, and stop codegen re-running
+        run: |
+          cp -R generated port-src/port/generated
+          F=port-src/port/generated/rexglue.cmake
+          perl -0pi -e 's/add_custom_command\(\s*OUTPUT "\$\{CMAKE_CURRENT_SOURCE_DIR\}\/generated\/default\/codegen\.build\.stamp".*?add_custom_target\(svr2011_codegen\s+DEPENDS "[^"]*"\)/add_custom_target(svr2011_codegen)/s' "$F"
+          echo "---- end of rexglue.cmake after patch ----"; tail -n 12 "$F"
+
+      - name: Configure the port (iOS arm64)
+        run: |
+          set -o pipefail
+          cmake -S port-src/port -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="-O1 -DNDEBUG" \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O1 -DNDEBUG" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_SHARED_LINKER_FLAGS="-framework UIKit -framework CoreGraphics" \
+            -DCMAKE_EXE_LINKER_FLAGS="-framework UIKit -framework CoreGraphics" \
+            -DREXSDK_DIR="$PWD/sdk" \
+            -DPLUME_DIR="$PWD/plume" \
+            -DREXGLUE_USE_VULKAN=ON \
+            -DREXGLUE_ENABLE_TRACY=OFF \
+            2>&1 | tee configure.log
+
+      - name: Build svr2011 (keeps going to show every error, then fails if there were any)
+        run: |
+          set -o pipefail
+          cmake --build build --target svr2011 -- -j3 -k 0 2>&1 | tee build.log
+
+      - name: Cache stats
+        if: always()
+        run: ccache -s || true
+
+      - name: Error summary
+        if: always()
+        run: |
+          {
+            echo "### port on iOS"
+            echo '```'
+            grep -hE "error:|CMake Error|FAILED:|fatal error|Undefined symbols" configure.log build.log 2>/dev/null | sed -E 's#/Users/runner/work/[^/]+/[^/]+/##' | sort -u | head -80 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: port-logs
+          path: |
+            configure.log
+            build.log
