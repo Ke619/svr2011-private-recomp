@@ -101,6 +101,138 @@ jobs:
           sed -n 20,35p "$f"
           grep -q 'malloc/malloc.h' "$f"
 
+      - name: iOS link fixes (music stubs + plume window wrapper)
+        run: |
+          # 1) the port's music.cpp is Windows/Android-only: no-op versions of the 8 functions the link asked for
+          cat > port-src/port/src/ios_stubs.cpp <<'EOF'
+          // iOS: no user music / host sound player yet. No-ops so the game links.
+          #include "music.h"
+          namespace svr2011 {
+          std::vector<std::filesystem::path> UserMusicSongs() { return {}; }
+          void SetSongGain(const std::filesystem::path&, float) {}
+          void PlayClip(const std::filesystem::path&) {}
+          int HostSoundStart(const std::filesystem::path&, bool, float) { return -1; }
+          void HostSoundStop(int) {}
+          void HostSoundPause(int, bool) {}
+          void HostSoundVolume(int, float) {}
+          bool HostSoundActive(int) { return false; }
+          }  // namespace svr2011
+          EOF
+          cat >> port-src/port/CMakeLists.txt <<'EOF'
+
+          if(IOS)
+            target_sources(svr2011 PRIVATE src/ios_stubs.cpp)
+          endif()
+          EOF
+
+          # 2) plume: UIKit version of CocoaWindow (plume_apple.mm is AppKit-only)
+          cat > plume/plume_ios.mm <<'EOF'
+          // iOS version of plume::CocoaWindow (the macOS one in plume_apple.mm uses AppKit).
+          // The handle is expected to be a UIWindow*, UIView* or CALayer* (not yet tested at run time).
+          #include "plume_apple.h"
+          #import <UIKit/UIKit.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <Foundation/Foundation.h>
+          #include <cmath>
+
+          namespace plume {
+              static bool plumeIosReadSize(void* handle, CocoaWindowAttributes* out) {
+                  id obj = (__bridge id)handle;
+                  CGRect b = CGRectZero;
+                  CGFloat scale = 1.0;
+                  if ([obj isKindOfClass:[UIWindow class]]) {
+                      UIWindow* w = (UIWindow*)obj;
+                      b = w.bounds;
+                      scale = w.screen.nativeScale;
+                  } else if ([obj isKindOfClass:[UIView class]]) {
+                      UIView* v = (UIView*)obj;
+                      b = v.bounds;
+                      scale = v.contentScaleFactor;
+                  } else if ([obj isKindOfClass:[CALayer class]]) {
+                      CALayer* l = (CALayer*)obj;
+                      b = l.bounds;
+                      scale = l.contentsScale;
+                  } else {
+                      return false;
+                  }
+                  out->x = (int)std::lround(b.origin.x);
+                  out->y = (int)std::lround(b.origin.y);
+                  out->width = (int)std::lround(b.size.width * scale);
+                  out->height = (int)std::lround(b.size.height * scale);
+                  return true;
+              }
+
+              CocoaWindow::CocoaWindow(void* window)
+                  : windowHandle(window), cachedAttributes{}, cachedRefreshRate(0) {
+                  updateWindowAttributesInternal(false);
+              }
+
+              CocoaWindow::~CocoaWindow() {}
+
+              void CocoaWindow::updateWindowAttributesInternal(bool forceSync) {
+                  auto updateBlock = ^{
+                      CocoaWindowAttributes a = {};
+                      if (plumeIosReadSize(windowHandle, &a)) {
+                          std::lock_guard<std::mutex> lock(attributesMutex);
+                          cachedAttributes = a;
+                      }
+                  };
+                  if (forceSync && ![NSThread isMainThread]) {
+                      dispatch_sync(dispatch_get_main_queue(), updateBlock);
+                  } else if ([NSThread isMainThread]) {
+                      updateBlock();
+                  } else {
+                      dispatch_async(dispatch_get_main_queue(), updateBlock);
+                  }
+              }
+
+              void CocoaWindow::updateRefreshRateInternal(bool forceSync) {
+                  auto updateBlock = ^{
+                      int fps = 60;
+                      id obj = (__bridge id)windowHandle;
+                      if ([obj isKindOfClass:[UIWindow class]]) {
+                          fps = (int)((UIWindow*)obj).screen.maximumFramesPerSecond;
+                      } else if ([obj isKindOfClass:[UIView class]] && ((UIView*)obj).window) {
+                          fps = (int)((UIView*)obj).window.screen.maximumFramesPerSecond;
+                      }
+                      cachedRefreshRate.store(fps);
+                  };
+                  if (forceSync && ![NSThread isMainThread]) {
+                      dispatch_sync(dispatch_get_main_queue(), updateBlock);
+                  } else if ([NSThread isMainThread]) {
+                      updateBlock();
+                  } else {
+                      dispatch_async(dispatch_get_main_queue(), updateBlock);
+                  }
+              }
+
+              void CocoaWindow::getWindowAttributes(CocoaWindowAttributes* attributes) const {
+                  const_cast<CocoaWindow*>(this)->updateWindowAttributesInternal(false);
+                  std::lock_guard<std::mutex> lock(attributesMutex);
+                  *attributes = cachedAttributes;
+              }
+
+              int CocoaWindow::getRefreshRate() const {
+                  const_cast<CocoaWindow*>(this)->updateRefreshRateInternal(false);
+                  int r = cachedRefreshRate.load();
+                  return r > 0 ? r : 60;
+              }
+
+              void CocoaWindow::toggleFullscreen() {}
+          }
+          EOF
+          cat >> plume/CMakeLists.txt <<'EOF'
+
+          if(IOS)
+            target_sources(plume PRIVATE plume_ios.mm)
+          endif()
+          EOF
+          echo "---- tails ----"
+          tail -n 5 port-src/port/CMakeLists.txt
+          tail -n 5 plume/CMakeLists.txt
+          test -f port-src/port/src/ios_stubs.cpp && test -f plume/plume_ios.mm
+          grep -q "plume_ios.mm" plume/CMakeLists.txt && grep -q "ios_stubs.cpp" port-src/port/CMakeLists.txt
+
       - name: Put the generated code in place, and stop codegen re-running
         run: |
           cp -R generated port-src/port/generated
