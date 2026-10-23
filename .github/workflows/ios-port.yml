@@ -233,6 +233,20 @@ jobs:
           test -f port-src/port/src/ios_stubs.cpp && test -f plume/plume_ios.mm
           grep -q "plume_ios.mm" plume/CMakeLists.txt && grep -q "ios_stubs.cpp" port-src/port/CMakeLists.txt
 
+      - name: iOS paths (game folder = app Documents; GPU plugin from Frameworks)
+        run: |
+          set -euo pipefail
+          F=sdk/src/core/filesystem_posix.cpp
+          P=sdk/src/system/gpu_plugin_loader.cpp
+          perl -0pi -e 's/\A/#if defined(__APPLE__)\n#include <TargetConditionals.h>\n#endif\n#include <cstdlib>\n#include <system_error>\n/' "$F" "$P"
+          perl -0pi -e 's/(std::filesystem::path GetExecutableFolder\(\) \{\n)/$1#if defined(__APPLE__) && TARGET_OS_IPHONE\n  \/\/ [ios] The app bundle is read-only: the game folder is the app\x27s Documents folder.\n  if (const char* home = std::getenv("HOME")) {\n    std::filesystem::path docs = std::filesystem::path(home) \/ "Documents";\n    std::error_code ec;\n    std::filesystem::create_directories(docs, ec);\n    return docs;\n  }\n#endif\n/' "$F"
+          perl -0pi -e 's/  auto path = rex::filesystem::GetExecutableFolder\(\) \/ PluginFileName\(name\);\n/#if defined(__APPLE__) && TARGET_OS_IPHONE\n  auto path = rex::filesystem::GetExecutablePath().parent_path() \/ "Frameworks" \/ PluginFileName(name);\n#else\n  auto path = rex::filesystem::GetExecutableFolder() \/ PluginFileName(name);\n#endif\n/' "$P"
+          echo "---- edited lines ----"
+          grep -n -A9 "GetExecutableFolder() {" "$F" | head -14
+          grep -n -B2 -A5 "Frameworks" "$P"
+          grep -q "TARGET_OS_IPHONE" "$F"
+          grep -q 'Frameworks' "$P"
+
       - name: Put the generated code in place, and stop codegen re-running
         run: |
           cp -R generated port-src/port/generated
