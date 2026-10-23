@@ -93,6 +93,14 @@ jobs:
           EOF
           grep -n "^project\|WIN32 OR ANDROID" port-src/port/CMakeLists.txt
 
+      - name: Patch bink_decode.c for Apple (malloc.h -> malloc/malloc.h)
+        run: |
+          f=port-src/port/launcher/bink_decode.c
+          perl -0pi -e 's|#include <malloc\.h>\n#define _msize malloc_usable_size|#ifdef __APPLE__\n#include <malloc/malloc.h>\n#define _msize malloc_size\n#else\n#include <malloc.h>\n#define _msize malloc_usable_size\n#endif|' "$f"
+          echo "---- edited lines ----"
+          sed -n 20,35p "$f"
+          grep -q 'malloc/malloc.h' "$f"
+
       - name: Put the generated code in place, and stop codegen re-running
         run: |
           cp -R generated port-src/port/generated
