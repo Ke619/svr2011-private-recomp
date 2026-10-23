@@ -269,6 +269,116 @@ jobs:
           set -o pipefail
           cmake --build build --target svr2011 -- -j3 -k 0 2>&1 | tee build.log
 
+      - name: Inspect the binary (platform, size, dependencies)
+        run: |
+          set -euo pipefail
+          exec > >(tee -a package.log) 2>&1
+          B=build/svr2011
+          ls -l "$B"
+          file "$B"
+          otool -l "$B" | grep -A5 LC_BUILD_VERSION
+          echo "---- exe dependencies ----"
+          otool -L "$B"
+          echo "---- exe rpaths ----"
+          otool -l "$B" | grep -A2 LC_RPATH || echo "(none)"
+          echo "---- SDK dylibs ----"
+          ls -l sdk/out/mac-arm64/*.dylib
+          for d in librexruntime.dylib librexgpu-xenos.dylib libMoltenVK.dylib; do
+            echo "== $d"; otool -L "sdk/out/mac-arm64/$d"
+          done
+
+      - name: Package unsigned IPA (best-effort first version)
+        run: |
+          set -euo pipefail
+          exec > >(tee -a package.log) 2>&1
+          APP="ipa/Payload/SvR2011.app"
+          FW="$APP/Frameworks"
+          rm -rf ipa svr2011-unsigned.ipa
+          mkdir -p "$FW"
+          cp build/svr2011 "$APP/svr2011"
+
+          # real dylib files (symlink names resolved to the real file)
+          for n in librexruntime.dylib librexgpu-xenos.dylib libMoltenVK.dylib libvulkan.dylib; do
+            src="sdk/out/mac-arm64/$n"
+            cp -L "$src" "$FW/$(basename "$(realpath "$src")")"
+          done
+
+          # point every dependency that lives in the build tree at @rpath/<file>, pulling it into Frameworks
+          for pass in 1 2 3; do
+            for f in "$APP/svr2011" "$FW"/*.dylib; do
+              otool -L "$f" | tail -n +2 | awk '{print $1}' | while read -r dep; do
+                case "$dep" in
+                  /usr/lib/*|/System/*) continue ;;
+                  @rpath/*) cand="sdk/out/mac-arm64/${dep#@rpath/}" ;;
+                  /*) cand="$dep" ;;
+                  *) continue ;;
+                esac
+                [ -e "$cand" ] || { echo "MISSING: $f -> $dep"; continue; }
+                base="$(basename "$(realpath "$cand")")"
+                [ -e "$FW/$base" ] || cp -L "$cand" "$FW/$base"
+                install_name_tool -change "$dep" "@rpath/$base" "$f"
+              done
+            done
+          done
+
+          # each dylib: own name; every file: drop build-machine rpaths, add the app's
+          for f in "$FW"/*.dylib; do install_name_tool -id "@rpath/$(basename "$f")" "$f"; done
+          for f in "$APP/svr2011" "$FW"/*.dylib; do
+            for rp in $(otool -l "$f" | awk '/LC_RPATH/{r=1} r && /path /{print $2; r=0}'); do
+              case "$rp" in /Users/*) install_name_tool -delete_rpath "$rp" "$f" ;; esac
+            done
+          done
+          install_name_tool -add_rpath "@executable_path/Frameworks" "$APP/svr2011"
+          for f in "$FW"/*.dylib; do install_name_tool -add_rpath "@loader_path" "$f"; done
+
+          cat > "$APP/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleIdentifier</key><string>com.ke619.svr2011</string>
+            <key>CFBundleName</key><string>SvR2011</string>
+            <key>CFBundleDisplayName</key><string>SvR 2011</string>
+            <key>CFBundleExecutable</key><string>svr2011</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.1</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
+            <key>MinimumOSVersion</key><string>17.0</string>
+            <key>UIDeviceFamily</key><array><integer>1</integer></array>
+            <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+            <key>UISupportedInterfaceOrientations</key>
+            <array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+            <key>UIRequiresFullScreen</key><true/>
+            <key>UIStatusBarHidden</key><true/>
+            <key>UILaunchScreen</key><dict/>
+            <key>UIFileSharingEnabled</key><true/>
+            <key>LSSupportsOpeningDocumentsInPlace</key><true/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$APP/Info.plist"
+
+          # leftover references to the build machine would make the app fail at launch
+          if otool -L "$APP/svr2011" "$FW"/*.dylib | grep "/Users/"; then
+            echo "ERROR: build-machine paths left in the binaries"; exit 1
+          fi
+
+          # ad-hoc signature (sideload tools replace it)
+          codesign --force --sign - "$FW"/*.dylib
+          codesign --force --sign - "$APP/svr2011"
+
+          (cd ipa && zip -qry ../svr2011-unsigned.ipa Payload)
+          ls -l svr2011-unsigned.ipa
+          echo "---- app contents ----"
+          ls -l "$APP" "$FW"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: svr2011-unsigned-ipa
+          path: svr2011-unsigned.ipa
+          retention-days: 3
+
       - name: Cache stats
         if: always()
         run: ccache -s || true
@@ -290,6 +400,7 @@ jobs:
           path: |
             configure.log
             build.log
+            package.log
 
       - uses: actions/cache/save@v4
         if: always()
