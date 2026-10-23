@@ -258,6 +258,7 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-framework UIKit -framework CoreGraphics" \
             -DCMAKE_EXE_LINKER_FLAGS="-framework UIKit -framework CoreGraphics" \
             -DREXSDK_DIR="$PWD/sdk" \
+            -DREXGLUE_ROOT="$PWD/sdk" \
             -DPLUME_DIR="$PWD/plume" \
             -DREXGLUE_USE_VULKAN=ON \
             -DREXGLUE_ENABLE_TRACY=OFF \
