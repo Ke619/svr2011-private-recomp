@@ -256,7 +256,7 @@ jobs:
           test -f port-src/port/src/ios_stubs.cpp && test -f plume/plume_ios.mm
           grep -q "plume_ios.mm" plume/CMakeLists.txt && grep -q "ios_stubs.cpp" port-src/port/CMakeLists.txt
 
-      - name: iOS paths (game folder = app Documents; GPU plugin from Frameworks)
+      - name: iOS paths and startup (game folder, GPU plugin, SDL entry point)
         run: |
           set -euo pipefail
           F=sdk/src/core/filesystem_posix.cpp
@@ -269,6 +269,18 @@ jobs:
           grep -n -B2 -A5 "Frameworks" "$P"
           grep -q "TARGET_OS_IPHONE" "$F"
           grep -q 'Frameworks' "$P"
+
+          # SDL must own the iOS entry point (UIApplicationMain), so main has to become SDL_main:
+          # without this SDL_InitSubSystem(VIDEO) fails and the app exits with code 1.
+          M=sdk/src/ui/windowed_app_main_sdl.cpp
+          perl -0pi -e 's/(#include <rex\/ui\/windowed_app_context_sdl\.h>\n)/$1\n#if defined(__APPLE__)\n#include <TargetConditionals.h>\n#if TARGET_OS_IPHONE\n#include <SDL3\/SDL_main.h>\n#endif\n#endif\n/' "$M"
+          # MoltenVK (Metal) has no geometry shaders or non-solid fill mode: do not require them.
+          perl -0pi -e 's/(  rex::cvar::ApplyEnvironment\(\);\n)(  rex::InitLoggingEarly\(\);)/$1#if defined(__APPLE__) && TARGET_OS_IPHONE\n  rex::cvar::SetFlagByName("vulkan_require_geometry_shader", "false");\n  rex::cvar::SetFlagByName("vulkan_require_fill_mode_non_solid", "false");\n#endif\n$2/' "$M"
+          echo "---- windowed_app_main_sdl.cpp edits ----"
+          grep -n -B1 -A6 "TargetConditionals" "$M"
+          grep -n -B2 -A3 "vulkan_require_geometry_shader" "$M"
+          grep -q "SDL3/SDL_main.h" "$M"
+          grep -q "vulkan_require_fill_mode_non_solid" "$M"
 
       - name: Put the generated code in place, and stop codegen re-running
         run: |
