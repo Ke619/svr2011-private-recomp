@@ -281,6 +281,14 @@ jobs:
           C=sdk/src/ui/windowed_app_context_sdl.cpp
           perl -0pi -e 's/\A/#if defined(__APPLE__)\n#include <TargetConditionals.h>\n#endif\n/' "$C"
           perl -0pi -e 's/requested_driver = "cocoa";/#if defined(TARGET_OS_IPHONE) \&\& TARGET_OS_IPHONE\n    requested_driver = "uikit";\n#else\n    requested_driver = "cocoa";\n#endif/' "$C"
+          # The Vulkan runtime lives in <app bundle>/vulkan. The SDK looks beside "the executable
+          # folder", which on iOS is now Documents, so point this one lookup at the bundle.
+          V=sdk/src/ui/vulkan/vulkan_moltenvk.cpp
+          perl -0pi -e 's/\A/#if defined(__APPLE__)\n#include <TargetConditionals.h>\n#endif\n/' "$V"
+          perl -0pi -e 's/  const fs::path executable_dir = rex::filesystem::GetExecutableFolder\(\);\n/#if defined(TARGET_OS_IPHONE) \&\& TARGET_OS_IPHONE\n  const fs::path executable_dir = rex::filesystem::GetExecutablePath().parent_path();\n#else\n  const fs::path executable_dir = rex::filesystem::GetExecutableFolder();\n#endif\n/' "$V"
+          echo "---- vulkan_moltenvk.cpp edit ----"
+          grep -n -B1 -A5 "GetExecutablePath" "$V"
+          grep -q "GetExecutablePath" "$V"
           echo "---- windowed_app_context_sdl.cpp edit ----"
           grep -n -B2 -A6 '"uikit"' "$C"
           grep -q '"uikit"' "$C"
@@ -354,8 +362,14 @@ jobs:
           mkdir -p "$FW"
           cp build/svr2011 "$APP/svr2011"
 
+          # the SDK's own staged Vulkan runtime (lib/ + share/vulkan/icd.d/); the app looks in <bundle>/vulkan
+          test -f build/vulkan/lib/libvulkan.1.dylib
+          test -f build/vulkan/lib/libMoltenVK.dylib
+          test -f build/vulkan/share/vulkan/icd.d/MoltenVK_icd.json
+          cp -RL build/vulkan "$APP/vulkan"
+
           # real dylib files (symlink names resolved to the real file)
-          for n in librexruntime.dylib librexgpu-xenos.dylib libMoltenVK.dylib libvulkan.dylib; do
+          for n in librexruntime.dylib librexgpu-xenos.dylib; do
             src="sdk/out/mac-arm64/$n"
             cp -L "$src" "$FW/$(basename "$(realpath "$src")")"
           done
@@ -417,18 +431,19 @@ jobs:
           plutil -lint "$APP/Info.plist"
 
           # leftover references to the build machine would make the app fail at launch
-          if otool -L "$APP/svr2011" "$FW"/*.dylib | grep "/Users/"; then
+          if otool -L "$APP/svr2011" "$FW"/*.dylib "$APP/vulkan/lib"/*.dylib | grep "/Users/"; then
             echo "ERROR: build-machine paths left in the binaries"; exit 1
           fi
 
           # ad-hoc signature (sideload tools replace it)
-          codesign --force --sign - "$FW"/*.dylib
+          codesign --force --sign - "$FW"/*.dylib "$APP/vulkan/lib"/*.dylib
           codesign --force --sign - "$APP/svr2011"
 
           (cd ipa && zip -qry ../svr2011-unsigned.ipa Payload)
           ls -l svr2011-unsigned.ipa
           echo "---- app contents ----"
           ls -l "$APP" "$FW"
+          find "$APP/vulkan" -type f -exec ls -l {} \;
 
       - uses: actions/upload-artifact@v4
         with:
