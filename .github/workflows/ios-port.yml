@@ -332,6 +332,15 @@ jobs:
           grep -q "SDL3/SDL_main.h" "$M"
           grep -q "vulkan_require_fill_mode_non_solid" "$M"
 
+      - name: iOS touch controls on by default
+        run: |
+          set -euo pipefail
+          T=port-src/port/src/touch_controls.cpp
+          perl -0pi -e 's/#if defined\(__ANDROID__\)\nREXCVAR_DEFINE_BOOL\(touch_controls, true/#if defined(__APPLE__)\n#include <TargetConditionals.h>\n#endif\n#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)\nREXCVAR_DEFINE_BOOL(touch_controls, true/' "$T"
+          echo "---- touch_controls edit ----"
+          grep -n -B5 -A4 "TARGET_OS_IPHONE" "$T"
+          grep -q "TARGET_OS_IPHONE" "$T"
+
       - name: Put the generated code in place, and stop codegen re-running
         run: |
           cp -R generated port-src/port/generated
