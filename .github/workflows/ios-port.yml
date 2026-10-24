@@ -276,6 +276,14 @@ jobs:
           perl -0pi -e 's/(#include <rex\/ui\/windowed_app_context_sdl\.h>\n)/$1\n#if defined(__APPLE__)\n#include <TargetConditionals.h>\n#if TARGET_OS_IPHONE\n#include <SDL3\/SDL_main.h>\n#endif\n#endif\n/' "$M"
           # MoltenVK (Metal) has no geometry shaders or non-solid fill mode: do not require them.
           perl -0pi -e 's/(  rex::cvar::ApplyEnvironment\(\);\n)(  rex::InitLoggingEarly\(\);)/$1#if defined(__APPLE__) && TARGET_OS_IPHONE\n  rex::cvar::SetFlagByName("vulkan_require_geometry_shader", "false");\n  rex::cvar::SetFlagByName("vulkan_require_fill_mode_non_solid", "false");\n#endif\n$2/' "$M"
+          # The SDK treats every Apple platform as macOS (REX_PLATFORM_MAC) and forces SDL's "cocoa"
+          # video driver, which does not exist on iOS ("cocoa not available"). iOS needs "uikit".
+          C=sdk/src/ui/windowed_app_context_sdl.cpp
+          perl -0pi -e 's/\A/#if defined(__APPLE__)\n#include <TargetConditionals.h>\n#endif\n/' "$C"
+          perl -0pi -e 's/requested_driver = "cocoa";/#if defined(TARGET_OS_IPHONE) \&\& TARGET_OS_IPHONE\n    requested_driver = "uikit";\n#else\n    requested_driver = "cocoa";\n#endif/' "$C"
+          echo "---- windowed_app_context_sdl.cpp edit ----"
+          grep -n -B2 -A6 '"uikit"' "$C"
+          grep -q '"uikit"' "$C"
           echo "---- windowed_app_main_sdl.cpp edits ----"
           grep -n -B1 -A6 "TargetConditionals" "$M"
           grep -n -B2 -A3 "vulkan_require_geometry_shader" "$M"
