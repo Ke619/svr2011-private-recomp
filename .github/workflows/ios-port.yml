@@ -422,8 +422,8 @@ jobs:
         run: |
           set -euo pipefail
           cat > port-src/port/src/ios_launcher.mm <<'EOF'
-          // iOS launcher: a small screen with a Play button and a settings screen, shown before the game
-          // starts. (A file named skip_launcher in Documents turns it off.)
+          // iOS launcher: a tabbed screen shown before the game starts (Play, Settings, Online, ...), the
+          // phone launcher's tabs as on Android. (A file named skip_launcher in Documents turns it off.)
           #import <UIKit/UIKit.h>
           #include <cmath>
           #include <cstdio>
@@ -434,9 +434,28 @@ jobs:
           #include <sys/stat.h>
           #include <unistd.h>
 
+          #define SVR_BG [UIColor colorWithRed:0.04 green:0.04 blue:0.06 alpha:1.0]
+          #define SVR_RED [UIColor colorWithRed:0.75 green:0.05 blue:0.08 alpha:1.0]
+          #define SVR_DIM [UIColor colorWithWhite:0.6 alpha:1.0]
+          #define SVR_TEXT [UIColor whiteColor]
+
           static bool SvrFileExists(const std::string& path) {
             struct stat st;
             return stat(path.c_str(), &st) == 0;
+          }
+
+          static std::string SvrStd(NSString* s) {
+            return s ? std::string([s UTF8String]) : std::string();
+          }
+
+          static NSString* SvrNS(const std::string& s) {
+            NSString* r = [NSString stringWithUTF8String:s.c_str()];
+            return r ? r : @"";
+          }
+
+          // A string from a JSON value (empty when it is not a string).
+          static std::string SvrStr(id v) {
+            return [v isKindOfClass:[NSString class]] ? SvrStd((NSString*)v) : std::string();
           }
 
           // ---- the settings file (Documents/svr2011.toml): flat "key = value" lines ----
@@ -480,6 +499,15 @@ jobs:
             return fallback;
           }
 
+          // A TOML string: the text in quotes (quote, backslash and line breaks cannot be in these fields).
+          static std::string SvrQuote(const std::string& v) {
+            std::string out = "\"";
+            for (char c : v) {
+              if (c != '"' && c != '\\' && c != '\n' && c != '\r') out += c;
+            }
+            return out + "\"";
+          }
+
           // Sets `key = value` among the top-level keys, keeping every other line (as the game does).
           static void SvrSet(const std::string& key, const std::string& value) {
             std::vector<std::string> lines = SvrReadConfig();
@@ -509,16 +537,16 @@ jobs:
               std::ofstream out(tmp, std::ios::trunc);
               for (const std::string& l : lines) out << l << "\n";
               if (!out) {
-                std::fprintf(stderr, "[boot] settings: could not write %s\n", tmp.c_str());
+                std::fprintf(stderr, "[boot] settings: could not write the settings file\n");
                 return;
               }
             }
             if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-              std::fprintf(stderr, "[boot] settings: could not replace %s\n", path.c_str());
+              std::fprintf(stderr, "[boot] settings: could not replace the settings file\n");
             }
           }
 
-          // ---- the options (the same values the in-game GRAPHICS page writes) ----
+          // ---- the graphics options (the same values the in-game GRAPHICS page writes) ----
 
           struct SvrScale {
             int max_scale;
@@ -531,11 +559,17 @@ jobs:
 
           // ---- small UIKit helpers ----
 
+          static UILabel* SvrLabel(NSString* text, CGFloat size, UIColor* color, BOOL bold) {
+            UILabel* l = [[UILabel alloc] init];
+            l.text = text;
+            l.textColor = color;
+            l.font = bold ? [UIFont boldSystemFontOfSize:size] : [UIFont systemFontOfSize:size];
+            l.numberOfLines = 0;
+            return l;
+          }
+
           static UIView* SvrRow(NSString* title, UIView* control) {
-            UILabel* label = [[UILabel alloc] init];
-            label.text = title;
-            label.textColor = [UIColor whiteColor];
-            label.font = [UIFont systemFontOfSize:16.0];
+            UILabel* label = SvrLabel(title, 16.0, SVR_TEXT, NO);
             [label.widthAnchor constraintEqualToConstant:150.0].active = YES;
             UIStackView* row = [[UIStackView alloc] initWithArrangedSubviews:@[ label, control ]];
             row.axis = UILayoutConstraintAxisHorizontal;
@@ -567,73 +601,68 @@ jobs:
             return sw;
           }
 
-          // ---- the settings screen ----
+          static UITextField* SvrField(NSString* placeholder, BOOL secure) {
+            UITextField* f = [[UITextField alloc] init];
+            f.borderStyle = UITextBorderStyleRoundedRect;
+            f.placeholder = placeholder;
+            f.secureTextEntry = secure;
+            f.autocapitalizationType = UITextAutocapitalizationTypeNone;
+            f.autocorrectionType = UITextAutocorrectionTypeNo;
+            f.spellCheckingType = UITextSpellCheckingTypeNo;
+            f.returnKeyType = UIReturnKeyDone;
+            f.keyboardAppearance = UIKeyboardAppearanceDark;
+            [f.heightAnchor constraintGreaterThanOrEqualToConstant:36.0].active = YES;
+            __weak UITextField* weakField = f;
+            [f addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
+              [weakField resignFirstResponder];
+            }] forControlEvents:UIControlEventEditingDidEndOnExit];
+            return f;
+          }
 
-          @interface SvrSettingsViewController : UIViewController
-          @end
-
-          @implementation SvrSettingsViewController
-
-          - (void)viewDidLoad {
-            [super viewDidLoad];
-            self.view.backgroundColor = [UIColor colorWithRed:0.04 green:0.04 blue:0.06 alpha:1.0];
-
-            UILabel* title = [[UILabel alloc] init];
-            title.text = @"Settings";
-            title.textColor = [UIColor whiteColor];
-            title.font = [UIFont boldSystemFontOfSize:26.0];
-            title.textAlignment = NSTextAlignmentCenter;
-            title.translatesAutoresizingMaskIntoConstraints = NO;
-            [self.view addSubview:title];
-
-            UIButtonConfiguration* doneCfg = [UIButtonConfiguration filledButtonConfiguration];
-            doneCfg.title = @"DONE";
-            doneCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-            doneCfg.baseBackgroundColor = [UIColor colorWithRed:0.75 green:0.05 blue:0.08 alpha:1.0];
-            UIButton* done = [UIButton buttonWithConfiguration:doneCfg primaryAction:nil];
-            done.translatesAutoresizingMaskIntoConstraints = NO;
-            __weak SvrSettingsViewController* weakSelf = self;
-            [done addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
-              [weakSelf dismissViewControllerAnimated:YES completion:nil];
+          static UIButton* SvrButton(NSString* title, BOOL filled, void (^onTap)(void)) {
+            UIButtonConfiguration* cfg =
+                filled ? [UIButtonConfiguration filledButtonConfiguration] : [UIButtonConfiguration tintedButtonConfiguration];
+            cfg.title = title;
+            cfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+            if (filled) cfg.baseBackgroundColor = SVR_RED;
+            UIButton* b = [UIButton buttonWithConfiguration:cfg primaryAction:nil];
+            [b addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
+              onTap();
             }] forControlEvents:UIControlEventTouchUpInside];
-            [self.view addSubview:done];
+            return b;
+          }
 
+          // A scrolling page: a vertical stack as wide as the page.
+          static UIScrollView* SvrScrollPage(UIStackView** outStack) {
             UIScrollView* scroll = [[UIScrollView alloc] init];
-            scroll.translatesAutoresizingMaskIntoConstraints = NO;
-            [self.view addSubview:scroll];
-
+            scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+            scroll.alwaysBounceVertical = YES;
             UIStackView* stack = [[UIStackView alloc] init];
             stack.axis = UILayoutConstraintAxisVertical;
             stack.spacing = 14.0;
             stack.translatesAutoresizingMaskIntoConstraints = NO;
             [scroll addSubview:stack];
-
-            UILayoutGuide* safe = self.view.safeAreaLayoutGuide;
             [NSLayoutConstraint activateConstraints:@[
-              [title.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8.0],
-              [title.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-              [done.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8.0],
-              [done.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-              [done.widthAnchor constraintEqualToConstant:200.0],
-              [scroll.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:8.0],
-              [scroll.bottomAnchor constraintEqualToAnchor:done.topAnchor constant:-8.0],
-              [scroll.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:40.0],
-              [scroll.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-40.0],
               [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor],
               [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor],
               [stack.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor],
               [stack.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor],
               [stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor],
             ]];
+            *outStack = stack;
+            return scroll;
+          }
+
+          // ---- the Settings page ----
+
+          static UIView* SvrBuildSettingsPage(void) {
+            UIStackView* stack = nil;
+            UIScrollView* page = SvrScrollPage(&stack);
 
             if (!SvrFileExists(SvrConfigPath())) {
-              UILabel* note = [[UILabel alloc] init];
-              note.text = @"The settings file does not exist yet.\nPress PLAY once so the game creates it, then come back here.";
-              note.numberOfLines = 0;
-              note.textColor = [UIColor colorWithWhite:0.8 alpha:1.0];
-              note.textAlignment = NSTextAlignmentCenter;
-              [stack addArrangedSubview:note];
-              return;
+              [stack addArrangedSubview:SvrLabel(@"The settings file does not exist yet.\nPress PLAY once so the game creates it, then come back here.",
+                                                 15.0, SVR_DIM, NO)];
+              return page;
             }
 
             const std::vector<std::string> cfg = SvrReadConfig();
@@ -711,14 +740,415 @@ jobs:
             [stack addArrangedSubview:SvrRow(@"Touch controls", SvrToggle(SvrGet(cfg, "touch_controls", "true") == "true", ^(BOOL on) {
               SvrSet("touch_controls", on ? "true" : "false");
             }))];
+            return page;
           }
 
-          - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-            return UIInterfaceOrientationMaskLandscape;
+          // ---- the Online page: server, account, friends (the server's JSON API, as on Android) ----
+
+          static NSString* const kSvrDefaultServer = @"https://sho-ti.me/svr";
+          static NSString* const kSvrCustomServer = @"127.0.0.1:8411";
+
+          // GETs (body nil) or POSTs JSON; calls `done` on the main queue with the answer's JSON (any status,
+          // "_status" added) or, when the server could not be reached, a failure text.
+          static void SvrRequest(NSString* url, NSDictionary* body, NSString* token,
+                                 void (^done)(NSDictionary* json, NSString* failure)) {
+            NSURL* u = [NSURL URLWithString:url];
+            if (!u) {
+              done(nil, @"the server address is not valid");
+              return;
+            }
+            NSMutableURLRequest* req = [NSMutableURLRequest requestWithURL:u
+                                                               cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                           timeoutInterval:20.0];
+            req.HTTPMethod = body ? @"POST" : @"GET";
+            if (token.length) [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+            if (body) {
+              [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+              req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+            }
+            NSURLSessionDataTask* task = [[NSURLSession sharedSession]
+                dataTaskWithRequest:req
+                  completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+                    NSMutableDictionary* json = [NSMutableDictionary dictionary];
+                    NSString* failure = nil;
+                    if (error) {
+                      failure = error.localizedDescription;
+                    } else {
+                      id parsed = data.length ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+                      if ([parsed isKindOfClass:[NSDictionary class]]) [json addEntriesFromDictionary:parsed];
+                      json[@"_status"] = @([(NSHTTPURLResponse*)response statusCode]);
+                    }
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                      done(failure ? nil : json, failure);
+                    });
+                  }];
+            [task resume];
           }
 
-          - (BOOL)prefersStatusBarHidden {
+          static NSString* SvrErrorText(NSDictionary* r, NSString* failure, BOOL create) {
+            if (r) {
+              id e = r[@"error"];
+              if ([e isKindOfClass:[NSString class]] && [(NSString*)e length]) return e;
+              const NSInteger code = [r[@"_status"] integerValue];
+              if (code == 403) return create ? @"That name is taken." : @"Wrong name or password.";
+              if (code == 429) return @"Too many tries - wait a little and try again.";
+              return [NSString stringWithFormat:@"The server said no (%ld).", (long)code];
+            }
+            return failure.length ? [@"Could not reach the server: " stringByAppendingString:failure]
+                                  : @"Could not reach the server.";
+          }
+
+          @interface SvrOnlinePage : NSObject
+          @property(nonatomic, strong) UIScrollView* view;
+          @property(nonatomic) BOOL busy;
+          @property(nonatomic) BOOL friendsBusy;
+          - (void)refresh;
+          @end
+
+          @implementation SvrOnlinePage {
+            UIStackView* _main;
+            UILabel* _noFile;
+            UISwitch* _enabled;
+            UISegmentedControl* _kind;
+            UITextField* _address;
+            UITextField* _name;
+            UITextField* _password;
+            UITextField* _friendName;
+            UILabel* _who;
+            UILabel* _accountStatus;
+            UILabel* _friendsStatus;
+            UIStackView* _serverBox;
+            UIStackView* _signedIn;
+            UIStackView* _signedOut;
+            UIStackView* _friendsBox;
+            UIStackView* _friendRows;
+            UIButton* _signInBtn;
+            UIButton* _createBtn;
+            UIButton* _signOutBtn;
+          }
+
+          - (instancetype)init {
+            self = [super init];
+            if (!self) return nil;
+            UIStackView* stack = nil;
+            _view = SvrScrollPage(&stack);
+            _main = stack;
+            __weak SvrOnlinePage* weakSelf = self;
+
+            [stack addArrangedSubview:SvrLabel(@"Community Creations: share Created Superstars, Paint Tool logos, highlight reels and more with other players, through a Community Creations server (the original servers closed in 2014). Online matches too: Player Match and Royal Rumble.",
+                                               14.0, SVR_DIM, NO)];
+            _noFile = SvrLabel(@"The settings file does not exist yet.\nPress PLAY once so the game creates it, then come back here.",
+                               15.0, SVR_TEXT, NO);
+            [stack addArrangedSubview:_noFile];
+
+            _enabled = SvrToggle(NO, ^(BOOL on) {
+              SvrSet("online_enabled", on ? "true" : "false");
+            });
+            [stack addArrangedSubview:SvrRow(@"Play online", _enabled)];
+
+            _kind = SvrSegment(@[ @"Default", @"Custom" ], 0, ^(NSInteger i) {
+              [weakSelf serverKindChanged:i];
+            });
+            [stack addArrangedSubview:SvrRow(@"Server", _kind)];
+            _address = SvrField(kSvrCustomServer, NO);
+            _address.keyboardType = UIKeyboardTypeURL;
+            [_address addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
+              [weakSelf saveServer];
+            }] forControlEvents:UIControlEventEditingDidEnd];
+            _serverBox = [[UIStackView alloc] initWithArrangedSubviews:@[ SvrRow(@"Address", _address) ]];
+            _serverBox.axis = UILayoutConstraintAxisVertical;
+            [stack addArrangedSubview:_serverBox];
+
+            [stack addArrangedSubview:SvrLabel(@"Account", 18.0, SVR_TEXT, YES)];
+            _who = SvrLabel(@"", 16.0, SVR_TEXT, NO);
+            _signedIn = [[UIStackView alloc] initWithArrangedSubviews:@[ _who ]];
+            _signedIn.axis = UILayoutConstraintAxisVertical;
+            [stack addArrangedSubview:_signedIn];
+            _name = SvrField(@"3-15 letters, digits, space _ . -", NO);
+            _password = SvrField(@"at least 6 characters", YES);
+            _signedOut = [[UIStackView alloc] initWithArrangedSubviews:@[ SvrRow(@"Name", _name), SvrRow(@"Password", _password) ]];
+            _signedOut.axis = UILayoutConstraintAxisVertical;
+            _signedOut.spacing = 10.0;
+            [stack addArrangedSubview:_signedOut];
+            _accountStatus = SvrLabel(@"", 13.0, SVR_DIM, NO);
+            [stack addArrangedSubview:_accountStatus];
+            _signInBtn = SvrButton(@"Sign in", YES, ^{
+              [weakSelf signIn:NO];
+            });
+            _createBtn = SvrButton(@"Create account", NO, ^{
+              [weakSelf signIn:YES];
+            });
+            _signOutBtn = SvrButton(@"Sign out", NO, ^{
+              [weakSelf signOut];
+            });
+            UIStackView* buttons = [[UIStackView alloc] initWithArrangedSubviews:@[ _signInBtn, _createBtn, _signOutBtn ]];
+            buttons.axis = UILayoutConstraintAxisHorizontal;
+            buttons.spacing = 12.0;
+            buttons.distribution = UIStackViewDistributionFillEqually;
+            [stack addArrangedSubview:buttons];
+
+            _friendRows = [[UIStackView alloc] init];
+            _friendRows.axis = UILayoutConstraintAxisVertical;
+            _friendsStatus = SvrLabel(@"", 13.0, SVR_DIM, NO);
+            _friendName = SvrField(@"Type a name, or tap a friend", NO);
+            UIButton* add = SvrButton(@"Add friend", YES, ^{
+              [weakSelf changeFriend:YES];
+            });
+            UIButton* remove = SvrButton(@"Remove", NO, ^{
+              [weakSelf changeFriend:NO];
+            });
+            UIButton* reload = SvrButton(@"Refresh", NO, ^{
+              [weakSelf fetchFriends:nil];
+            });
+            UIStackView* friendButtons = [[UIStackView alloc] initWithArrangedSubviews:@[ add, remove, reload ]];
+            friendButtons.axis = UILayoutConstraintAxisHorizontal;
+            friendButtons.spacing = 12.0;
+            friendButtons.distribution = UIStackViewDistributionFillEqually;
+            _friendsBox = [[UIStackView alloc] initWithArrangedSubviews:@[
+              SvrLabel(@"Friends", 18.0, SVR_TEXT, YES), _friendRows, _friendsStatus, SvrRow(@"Player", _friendName),
+              friendButtons
+            ]];
+            _friendsBox.axis = UILayoutConstraintAxisVertical;
+            _friendsBox.spacing = 10.0;
+            [stack addArrangedSubview:_friendsBox];
+
+            [self refresh];
+            return self;
+          }
+
+          + (NSString*)baseFor:(NSString*)server {
+            NSString* b = [server containsString:@"://"] ? server : [@"http://" stringByAppendingString:server];
+            while ([b hasSuffix:@"/"]) b = [b substringToIndex:b.length - 1];
+            return b;
+          }
+
+          + (BOOL)validName:(NSString*)n {
+            if (n.length < 3 || n.length > 15) return NO;
+            for (NSUInteger i = 0; i < n.length; ++i) {
+              const unichar c = [n characterAtIndex:i];
+              const BOOL ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == ' ' ||
+                              c == '_' || c == '.' || c == '-';
+              if (!ok) return NO;
+            }
             return YES;
+          }
+
+          - (NSString*)currentServer {
+            return SvrNS(SvrGet(SvrReadConfig(), "online_server", SvrStd(kSvrDefaultServer)));
+          }
+
+          // Reads the saved state into the controls.
+          - (void)refresh {
+            const BOOL hasFile = SvrFileExists(SvrConfigPath());
+            _noFile.hidden = hasFile;
+            NSArray<UIView*>* all = _main.arrangedSubviews;
+            for (NSUInteger i = 2; i < all.count; ++i) all[i].hidden = !hasFile;
+            if (!hasFile) return;
+            const std::vector<std::string> cfg = SvrReadConfig();
+            _enabled.on = SvrGet(cfg, "online_enabled", "false") == "true";
+            const std::string server = SvrGet(cfg, "online_server", SvrStd(kSvrDefaultServer));
+            const BOOL custom = !server.empty() && server != SvrStd(kSvrDefaultServer);
+            _kind.selectedSegmentIndex = custom ? 1 : 0;
+            _serverBox.hidden = !custom;
+            _address.text = custom ? SvrNS(server) : kSvrCustomServer;
+            [self refreshAccount];
+          }
+
+          - (void)refreshAccount {
+            const std::vector<std::string> cfg = SvrReadConfig();
+            const std::string token = SvrGet(cfg, "online_token", "");
+            const std::string name = SvrGet(cfg, "online_name", "");
+            const std::string server = SvrGet(cfg, "online_server", SvrStd(kSvrDefaultServer));
+            const BOOL custom = !server.empty() && server != SvrStd(kSvrDefaultServer);
+            const BOOL in = !token.empty();
+            _signedIn.hidden = !in;
+            _signedOut.hidden = in;
+            _who.text = [NSString stringWithFormat:@"Signed in as %@%@.", SvrNS(name),
+                                                   custom ? [@" on " stringByAppendingString:SvrNS(server)] : @""];
+            if (!in && _name.text.length == 0) _name.text = SvrNS(name);
+            _signInBtn.hidden = in;
+            _createBtn.hidden = in;
+            _signOutBtn.hidden = !in;
+            // (an account works on the server that made it: sign out to change servers)
+            _kind.enabled = !in;
+            _address.enabled = !in;
+            _signInBtn.enabled = !self.busy;
+            _createBtn.enabled = !self.busy;
+            _signOutBtn.enabled = !self.busy;
+            _friendsBox.hidden = !in;
+            if (in) {
+              [self fetchFriends:nil];
+            } else {
+              for (UIView* v in [_friendRows.arrangedSubviews copy]) [v removeFromSuperview];
+            }
+          }
+
+          - (void)serverKindChanged:(NSInteger)i {
+            const BOOL custom = i == 1;
+            _serverBox.hidden = !custom;
+            if (custom && _address.text.length == 0) _address.text = kSvrCustomServer;
+            [self saveServer];
+          }
+
+          - (void)saveServer {
+            const BOOL custom = _kind.selectedSegmentIndex == 1;
+            const std::string value = custom ? SvrTrim(SvrStd(_address.text)) : SvrStd(kSvrDefaultServer);
+            if (custom && value.empty()) return;
+            SvrSet("online_server", SvrQuote(value));
+          }
+
+          - (void)signIn:(BOOL)create {
+            if (self.busy) return;
+            NSString* name = [_name.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            NSString* password = _password.text ? _password.text : @"";
+            if (![SvrOnlinePage validName:name]) {
+              _accountStatus.text = @"Names are 3-15 letters, digits, spaces or _ . -";
+              return;
+            }
+            if (password.length < 6) {
+              _accountStatus.text = @"Passwords are at least 6 characters.";
+              return;
+            }
+            self.busy = YES;
+            _accountStatus.text = create ? @"Creating the account…" : @"Signing in…";
+            [self refreshAccount];
+            NSString* base = [SvrOnlinePage baseFor:[self currentServer]];
+            __weak SvrOnlinePage* weakSelf = self;
+            SvrRequest([base stringByAppendingString:create ? @"/api/register" : @"/api/login"],
+                       @{@"name" : name, @"password" : password}, nil, ^(NSDictionary* r, NSString* failure) {
+                         [weakSelf finishSignIn:r failure:failure create:create name:name];
+                       });
+          }
+
+          - (void)finishSignIn:(NSDictionary*)r failure:(NSString*)failure create:(BOOL)create name:(NSString*)name {
+            self.busy = NO;
+            if (r && [r[@"ok"] boolValue]) {
+              std::string shown = SvrStr(r[@"name"]);
+              if (shown.empty()) shown = SvrStd(name);
+              SvrSet("online_token", SvrQuote(SvrStr(r[@"token"])));
+              SvrSet("online_xuid", SvrQuote(SvrStr(r[@"xuid"])));
+              SvrSet("online_name", SvrQuote(shown));
+              SvrSet("online_enabled", "true");
+              _password.text = @"";
+              _accountStatus.text = create ? @"Account created. Signed in - online play is on."
+                                           : @"Signed in - online play is on.";
+              [self refresh];
+            } else {
+              _accountStatus.text = SvrErrorText(r, failure, create);
+              [self refreshAccount];
+            }
+          }
+
+          - (void)signOut {
+            if (self.busy) return;
+            const std::string token = SvrGet(SvrReadConfig(), "online_token", "");
+            NSString* base = [SvrOnlinePage baseFor:[self currentServer]];
+            self.busy = YES;
+            [self refreshAccount];
+            __weak SvrOnlinePage* weakSelf = self;
+            // (signed out here whatever the server says)
+            SvrRequest([base stringByAppendingString:@"/api/logout"], @{}, SvrNS(token),
+                       ^(NSDictionary* r, NSString* failure) {
+                         [weakSelf finishSignOut];
+                       });
+          }
+
+          - (void)finishSignOut {
+            self.busy = NO;
+            SvrSet("online_token", "\"\"");
+            SvrSet("online_xuid", "\"\"");
+            _accountStatus.text = @"Signed out.";
+            [self refreshAccount];
+          }
+
+          // body nil: the list; else {"add": name} / {"remove": name}.
+          - (void)fetchFriends:(NSDictionary*)body {
+            const std::string token = SvrGet(SvrReadConfig(), "online_token", "");
+            if (token.empty() || self.friendsBusy) return;
+            self.friendsBusy = YES;
+            NSString* url = [[SvrOnlinePage baseFor:[self currentServer]] stringByAppendingString:@"/api/friends"];
+            __weak SvrOnlinePage* weakSelf = self;
+            SvrRequest(url, body, SvrNS(token), ^(NSDictionary* r, NSString* failure) {
+              SvrOnlinePage* s = weakSelf;
+              if (!s) return;
+              s.friendsBusy = NO;
+              [s showFriends:r failure:failure];
+            });
+          }
+
+          - (void)addFriendRow:(NSString*)name status:(NSString*)status online:(BOOL)on {
+            UIButtonConfiguration* cfg = [UIButtonConfiguration plainButtonConfiguration];
+            cfg.title = [NSString stringWithFormat:@"%@   -   %@", name, status];
+            cfg.baseForegroundColor = on ? [UIColor colorWithRed:0.3 green:0.85 blue:0.39 alpha:1.0] : SVR_TEXT;
+            UIButton* row = [UIButton buttonWithConfiguration:cfg primaryAction:nil];
+            row.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+            __weak UITextField* field = _friendName;
+            [row addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
+              field.text = name;
+            }] forControlEvents:UIControlEventTouchUpInside];
+            [_friendRows addArrangedSubview:row];
+          }
+
+          - (void)showFriends:(NSDictionary*)r failure:(NSString*)failure {
+            if (SvrGet(SvrReadConfig(), "online_token", "").empty()) return;
+            id list = r ? r[@"friends"] : nil;
+            if (![list isKindOfClass:[NSArray class]]) {
+              const NSInteger code = [r[@"_status"] integerValue];
+              id e = r ? r[@"error"] : nil;
+              const BOOL noError = ![e isKindOfClass:[NSString class]] || [(NSString*)e length] == 0;
+              _friendsStatus.text = (r && code == 404 && noError) ? @"This server has no friends list yet."
+                                                                  : SvrErrorText(r, failure, NO);
+              return;
+            }
+            for (UIView* v in [_friendRows.arrangedSubviews copy]) [v removeFromSuperview];
+            NSUInteger online = 0;
+            for (id item in (NSArray*)list) {
+              if (![item isKindOfClass:[NSDictionary class]]) continue;
+              NSDictionary* f = item;
+              NSString* status = [f[@"status"] isKindOfClass:[NSString class]] ? f[@"status"] : @"";
+              NSString* name = [f[@"name"] isKindOfClass:[NSString class]] ? f[@"name"] : @"";
+              NSString* label = @"Offline";
+              if ([status isEqualToString:@"playing"]) {
+                label = @"In an online match";
+                online++;
+              } else if ([status isEqualToString:@"online"]) {
+                label = @"Online";
+                online++;
+              } else if (![f[@"mutual"] boolValue]) {
+                label = @"Offline (hasn't added you)";
+              }
+              [self addFriendRow:name status:label online:![status isEqualToString:@"offline"]];
+            }
+            id added = r[@"added_you"];
+            if ([added isKindOfClass:[NSArray class]]) {
+              for (id n in (NSArray*)added) {
+                if ([n isKindOfClass:[NSString class]]) [self addFriendRow:n status:@"Added you - add them back" online:NO];
+              }
+            }
+            const NSUInteger count = [(NSArray*)list count];
+            NSMutableString* text = [NSMutableString string];
+            if (count == 0) {
+              [text appendString:@"No friends yet: type a player's name and add them."];
+            } else {
+              [text appendFormat:@"%lu of %lu friend%@ online.", (unsigned long)online, (unsigned long)count,
+                                 count == 1 ? @"" : @"s"];
+            }
+            id now = r[@"online_now"];
+            if ([now isKindOfClass:[NSNumber class]] && [now integerValue] >= 0) {
+              [text appendFormat:@"  %ld player%@ playing now.", (long)[now integerValue], [now integerValue] == 1 ? @"" : @"s"];
+            }
+            _friendsStatus.text = text;
+          }
+
+          - (void)changeFriend:(BOOL)add {
+            NSString* name = [_friendName.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (name.length == 0) {
+              _friendsStatus.text = add ? @"Type the player's name to add." : @"Tap a friend (or type the name) to remove.";
+              return;
+            }
+            NSString* action = add ? @"add" : @"remove";
+            [self fetchFriends:@{action : name}];
+            if (add) _friendName.text = @"";
           }
 
           @end
@@ -729,28 +1159,23 @@ jobs:
           @property(nonatomic, copy) void (^onPlay)(void);
           @end
 
-          @implementation SvrLauncherViewController
+          @implementation SvrLauncherViewController {
+            UIView* _content;
+            UIView* _playPage;
+            SvrOnlinePage* _online;
+          }
 
-          - (void)viewDidLoad {
-            [super viewDidLoad];
-            self.view.backgroundColor = [UIColor colorWithRed:0.04 green:0.04 blue:0.06 alpha:1.0];
-
+          - (UIView*)buildPlayPage {
             const char* home = getenv("HOME");
             const std::string docs = home ? std::string(home) + "/Documents" : std::string();
             const bool hasGame = SvrFileExists(docs + "/default.xex");
             const bool hasShaders = SvrFileExists(docs + "/native_shaders/shaders.spv.pak");
 
-            UILabel* title = [[UILabel alloc] init];
-            title.text = @"SmackDown vs. Raw 2011";
-            title.textColor = [UIColor whiteColor];
-            title.font = [UIFont boldSystemFontOfSize:32.0];
+            UILabel* title = SvrLabel(@"SmackDown vs. Raw 2011", 32.0, SVR_TEXT, YES);
             title.textAlignment = NSTextAlignmentCenter;
 
             NSString* version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-            UILabel* sub = [[UILabel alloc] init];
-            sub.text = [NSString stringWithFormat:@"iPhone port  %@", version ? version : @""];
-            sub.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
-            sub.font = [UIFont systemFontOfSize:14.0];
+            UILabel* sub = SvrLabel([NSString stringWithFormat:@"iPhone port  %@", version ? version : @""], 14.0, SVR_DIM, NO);
             sub.textAlignment = NSTextAlignmentCenter;
 
             NSMutableString* info = [NSMutableString string];
@@ -761,53 +1186,88 @@ jobs:
             } else {
               [info appendString:@"\nGame folder:\n"];
             }
-            [info appendString:[NSString stringWithUTF8String:docs.c_str()]];
-            UILabel* status = [[UILabel alloc] init];
-            status.text = info;
-            status.numberOfLines = 0;
+            [info appendString:SvrNS(docs)];
+            UILabel* status = SvrLabel(info, 12.0, [UIColor colorWithWhite:0.8 alpha:1.0], NO);
             status.lineBreakMode = NSLineBreakByCharWrapping;
-            status.textColor = [UIColor colorWithWhite:0.8 alpha:1.0];
             status.font = [UIFont monospacedSystemFontOfSize:12.0 weight:UIFontWeightRegular];
             status.textAlignment = NSTextAlignmentCenter;
 
-            UIButtonConfiguration* cfg = [UIButtonConfiguration filledButtonConfiguration];
-            cfg.title = @"PLAY";
-            cfg.buttonSize = UIButtonConfigurationSizeLarge;
-            cfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-            cfg.baseBackgroundColor = [UIColor colorWithRed:0.75 green:0.05 blue:0.08 alpha:1.0];
-            UIButton* play = [UIButton buttonWithConfiguration:cfg primaryAction:nil];
-            play.enabled = hasGame;
             __weak SvrLauncherViewController* weakSelf = self;
-            [play addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
+            UIButton* play = SvrButton(@"PLAY", YES, ^{
               SvrLauncherViewController* strongSelf = weakSelf;
               if (strongSelf && strongSelf.onPlay) strongSelf.onPlay();
-            }] forControlEvents:UIControlEventTouchUpInside];
+            });
+            play.enabled = hasGame;
 
-            UIButtonConfiguration* settingsCfg = [UIButtonConfiguration tintedButtonConfiguration];
-            settingsCfg.title = @"SETTINGS";
-            settingsCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-            UIButton* settings = [UIButton buttonWithConfiguration:settingsCfg primaryAction:nil];
-            [settings addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
-              SvrLauncherViewController* strongSelf = weakSelf;
-              if (!strongSelf) return;
-              SvrSettingsViewController* page = [[SvrSettingsViewController alloc] init];
-              page.modalPresentationStyle = UIModalPresentationFullScreen;
-              [strongSelf presentViewController:page animated:YES completion:nil];
-            }] forControlEvents:UIControlEventTouchUpInside];
-
-            UIStackView* stack = [[UIStackView alloc] initWithArrangedSubviews:@[ title, sub, status, play, settings ]];
+            UIStackView* stack = [[UIStackView alloc] initWithArrangedSubviews:@[ title, sub, status, play ]];
             stack.axis = UILayoutConstraintAxisVertical;
             stack.spacing = 16.0;
             stack.alignment = UIStackViewAlignmentCenter;
             stack.translatesAutoresizingMaskIntoConstraints = NO;
-            [self.view addSubview:stack];
+            UIView* page = [[UIView alloc] init];
+            [page addSubview:stack];
             [NSLayoutConstraint activateConstraints:@[
-              [stack.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-              [stack.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
-              [stack.widthAnchor constraintLessThanOrEqualToAnchor:self.view.widthAnchor multiplier:0.9],
+              [stack.centerXAnchor constraintEqualToAnchor:page.centerXAnchor],
+              [stack.centerYAnchor constraintEqualToAnchor:page.centerYAnchor],
+              [stack.widthAnchor constraintLessThanOrEqualToAnchor:page.widthAnchor],
               [play.widthAnchor constraintEqualToConstant:260.0],
-              [settings.widthAnchor constraintEqualToConstant:260.0],
             ]];
+            return page;
+          }
+
+          - (void)showPage:(NSInteger)index {
+            [self.view endEditing:YES];
+            for (UIView* v in [_content.subviews copy]) [v removeFromSuperview];
+            UIView* page = nil;
+            if (index == 1) {
+              page = SvrBuildSettingsPage();  // rebuilt each time, so it shows what is saved
+            } else if (index == 2) {
+              [_online refresh];
+              page = _online.view;
+            } else {
+              page = _playPage;
+            }
+            page.translatesAutoresizingMaskIntoConstraints = NO;
+            [_content addSubview:page];
+            [NSLayoutConstraint activateConstraints:@[
+              [page.topAnchor constraintEqualToAnchor:_content.topAnchor],
+              [page.bottomAnchor constraintEqualToAnchor:_content.bottomAnchor],
+              [page.leadingAnchor constraintEqualToAnchor:_content.leadingAnchor],
+              [page.trailingAnchor constraintEqualToAnchor:_content.trailingAnchor],
+            ]];
+          }
+
+          - (void)viewDidLoad {
+            [super viewDidLoad];
+            self.view.backgroundColor = SVR_BG;
+
+            UISegmentedControl* tabs = [[UISegmentedControl alloc] initWithItems:@[ @"Play", @"Settings", @"Online" ]];
+            tabs.selectedSegmentIndex = 0;
+            tabs.translatesAutoresizingMaskIntoConstraints = NO;
+            [self.view addSubview:tabs];
+            _content = [[UIView alloc] init];
+            _content.translatesAutoresizingMaskIntoConstraints = NO;
+            [self.view addSubview:_content];
+
+            UILayoutGuide* safe = self.view.safeAreaLayoutGuide;
+            [NSLayoutConstraint activateConstraints:@[
+              [tabs.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8.0],
+              [tabs.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:40.0],
+              [tabs.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-40.0],
+              [_content.topAnchor constraintEqualToAnchor:tabs.bottomAnchor constant:10.0],
+              [_content.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:40.0],
+              [_content.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-40.0],
+              [_content.bottomAnchor constraintEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor constant:-4.0],
+            ]];
+
+            _playPage = [self buildPlayPage];
+            _online = [[SvrOnlinePage alloc] init];
+            __weak SvrLauncherViewController* weakSelf = self;
+            [tabs addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
+              UISegmentedControl* t = (UISegmentedControl*)action.sender;
+              [weakSelf showPage:t.selectedSegmentIndex];
+            }] forControlEvents:UIControlEventValueChanged];
+            [self showPage:0];
           }
 
           - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
@@ -1016,6 +1476,10 @@ jobs:
             <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
             <key>MinimumOSVersion</key><string>17.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer></array>
+            <key>NSAppTransportSecurity</key>
+            <dict><key>NSAllowsArbitraryLoads</key><true/></dict>
+            <key>NSLocalNetworkUsageDescription</key>
+            <string>Lets the game reach a Community Creations server on your local network.</string>
             <key>CFBundleIcons</key>
             <dict>
               <key>CFBundlePrimaryIcon</key>
@@ -1096,4 +1560,4 @@ jobs:
         if: always()
         with:
           path: .ccache
-          key: ccache-${{ github.run_id }} 
+          key: ccache-${{ github.run_id }}
