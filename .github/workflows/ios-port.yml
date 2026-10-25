@@ -422,12 +422,15 @@ jobs:
         run: |
           set -euo pipefail
           cat > port-src/port/src/ios_launcher.mm <<'EOF'
-          // iOS launcher: a small screen with a Play button, shown before the game starts.
-          // (A file named skip_launcher in Documents turns it off.)
+          // iOS launcher: a small screen with a Play button and a settings screen, shown before the game
+          // starts. (A file named skip_launcher in Documents turns it off.)
           #import <UIKit/UIKit.h>
+          #include <cmath>
           #include <cstdio>
           #include <cstdlib>
+          #include <fstream>
           #include <string>
+          #include <vector>
           #include <sys/stat.h>
           #include <unistd.h>
 
@@ -435,6 +438,292 @@ jobs:
             struct stat st;
             return stat(path.c_str(), &st) == 0;
           }
+
+          // ---- the settings file (Documents/svr2011.toml): flat "key = value" lines ----
+
+          static std::string SvrConfigPath() {
+            const char* home = getenv("HOME");
+            return home ? std::string(home) + "/Documents/svr2011.toml" : std::string();
+          }
+
+          static std::string SvrTrim(const std::string& s) {
+            const size_t a = s.find_first_not_of(" \t\r");
+            if (a == std::string::npos) return std::string();
+            const size_t b = s.find_last_not_of(" \t\r");
+            return s.substr(a, b - a + 1);
+          }
+
+          static std::vector<std::string> SvrReadConfig() {
+            std::vector<std::string> lines;
+            std::ifstream in(SvrConfigPath());
+            for (std::string line; std::getline(in, line);) lines.push_back(line);
+            return lines;
+          }
+
+          // The value of a top-level key (quotes removed), or `fallback` when the key is not there.
+          static std::string SvrGet(const std::vector<std::string>& lines, const std::string& key,
+                                    const std::string& fallback) {
+            for (const std::string& l : lines) {
+              const size_t first = l.find_first_not_of(" \t");
+              if (first == std::string::npos || l[first] == '#') continue;
+              if (l[first] == '[') break;
+              const size_t eq = l.find('=');
+              if (eq == std::string::npos) continue;
+              if (SvrTrim(l.substr(first, eq - first)) != key) continue;
+              std::string v = l.substr(eq + 1);
+              const size_t hash = v.find(" #");
+              if (hash != std::string::npos) v = v.substr(0, hash);
+              v = SvrTrim(v);
+              if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+              return v;
+            }
+            return fallback;
+          }
+
+          // Sets `key = value` among the top-level keys, keeping every other line (as the game does).
+          static void SvrSet(const std::string& key, const std::string& value) {
+            std::vector<std::string> lines = SvrReadConfig();
+            const std::string entry = key + " = " + value;
+            size_t insert_at = lines.size();
+            bool done = false;
+            for (size_t i = 0; i < lines.size(); ++i) {
+              const std::string& l = lines[i];
+              const size_t first = l.find_first_not_of(" \t");
+              if (first == std::string::npos) continue;
+              if (l[first] == '[') {
+                insert_at = i;
+                break;
+              }
+              const size_t eq = l.find('=');
+              if (eq == std::string::npos || l[first] == '#') continue;
+              if (SvrTrim(l.substr(first, eq - first)) == key) {
+                lines[i] = entry;
+                done = true;
+                break;
+              }
+            }
+            if (!done) lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(insert_at), entry);
+            const std::string path = SvrConfigPath();
+            const std::string tmp = path + ".tmp";
+            {
+              std::ofstream out(tmp, std::ios::trunc);
+              for (const std::string& l : lines) out << l << "\n";
+              if (!out) {
+                std::fprintf(stderr, "[boot] settings: could not write %s\n", tmp.c_str());
+                return;
+              }
+            }
+            if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+              std::fprintf(stderr, "[boot] settings: could not replace %s\n", path.c_str());
+            }
+          }
+
+          // ---- the options (the same values the in-game GRAPHICS page writes) ----
+
+          struct SvrScale {
+            int max_scale;
+            double res;
+            int height;
+          };
+          static const SvrScale kSvrScales[] = {
+              {1, 0.5, 0}, {1, 2.0 / 3.0, 0}, {1, 1.0, 0}, {2, 1.0, 900}, {2, 1.0, 1080}};  // 360p 480p 720p 900p 1080p
+          static const char* const kSvrTextureQualities[] = {"high", "medium", "low"};
+
+          // ---- small UIKit helpers ----
+
+          static UIView* SvrRow(NSString* title, UIView* control) {
+            UILabel* label = [[UILabel alloc] init];
+            label.text = title;
+            label.textColor = [UIColor whiteColor];
+            label.font = [UIFont systemFontOfSize:16.0];
+            [label.widthAnchor constraintEqualToConstant:150.0].active = YES;
+            UIStackView* row = [[UIStackView alloc] initWithArrangedSubviews:@[ label, control ]];
+            row.axis = UILayoutConstraintAxisHorizontal;
+            row.alignment = UIStackViewAlignmentCenter;
+            row.spacing = 16.0;
+            return row;
+          }
+
+          static UISegmentedControl* SvrSegment(NSArray<NSString*>* items, NSInteger selected,
+                                                void (^onChange)(NSInteger)) {
+            UISegmentedControl* seg = [[UISegmentedControl alloc] initWithItems:items];
+            seg.selectedSegmentIndex = selected;
+            __weak UISegmentedControl* weakSeg = seg;
+            [seg addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
+              UISegmentedControl* s = weakSeg;
+              if (s) onChange(s.selectedSegmentIndex);
+            }] forControlEvents:UIControlEventValueChanged];
+            return seg;
+          }
+
+          static UISwitch* SvrToggle(BOOL on, void (^onChange)(BOOL)) {
+            UISwitch* sw = [[UISwitch alloc] init];
+            sw.on = on;
+            __weak UISwitch* weakSw = sw;
+            [sw addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
+              UISwitch* s = weakSw;
+              if (s) onChange(s.isOn);
+            }] forControlEvents:UIControlEventValueChanged];
+            return sw;
+          }
+
+          // ---- the settings screen ----
+
+          @interface SvrSettingsViewController : UIViewController
+          @end
+
+          @implementation SvrSettingsViewController
+
+          - (void)viewDidLoad {
+            [super viewDidLoad];
+            self.view.backgroundColor = [UIColor colorWithRed:0.04 green:0.04 blue:0.06 alpha:1.0];
+
+            UILabel* title = [[UILabel alloc] init];
+            title.text = @"Settings";
+            title.textColor = [UIColor whiteColor];
+            title.font = [UIFont boldSystemFontOfSize:26.0];
+            title.textAlignment = NSTextAlignmentCenter;
+            title.translatesAutoresizingMaskIntoConstraints = NO;
+            [self.view addSubview:title];
+
+            UIButtonConfiguration* doneCfg = [UIButtonConfiguration filledButtonConfiguration];
+            doneCfg.title = @"DONE";
+            doneCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+            doneCfg.baseBackgroundColor = [UIColor colorWithRed:0.75 green:0.05 blue:0.08 alpha:1.0];
+            UIButton* done = [UIButton buttonWithConfiguration:doneCfg primaryAction:nil];
+            done.translatesAutoresizingMaskIntoConstraints = NO;
+            __weak SvrSettingsViewController* weakSelf = self;
+            [done addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
+              [weakSelf dismissViewControllerAnimated:YES completion:nil];
+            }] forControlEvents:UIControlEventTouchUpInside];
+            [self.view addSubview:done];
+
+            UIScrollView* scroll = [[UIScrollView alloc] init];
+            scroll.translatesAutoresizingMaskIntoConstraints = NO;
+            [self.view addSubview:scroll];
+
+            UIStackView* stack = [[UIStackView alloc] init];
+            stack.axis = UILayoutConstraintAxisVertical;
+            stack.spacing = 14.0;
+            stack.translatesAutoresizingMaskIntoConstraints = NO;
+            [scroll addSubview:stack];
+
+            UILayoutGuide* safe = self.view.safeAreaLayoutGuide;
+            [NSLayoutConstraint activateConstraints:@[
+              [title.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8.0],
+              [title.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+              [done.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8.0],
+              [done.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+              [done.widthAnchor constraintEqualToConstant:200.0],
+              [scroll.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:8.0],
+              [scroll.bottomAnchor constraintEqualToAnchor:done.topAnchor constant:-8.0],
+              [scroll.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:40.0],
+              [scroll.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-40.0],
+              [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor],
+              [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor],
+              [stack.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor],
+              [stack.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor],
+              [stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor],
+            ]];
+
+            if (!SvrFileExists(SvrConfigPath())) {
+              UILabel* note = [[UILabel alloc] init];
+              note.text = @"The settings file does not exist yet.\nPress PLAY once so the game creates it, then come back here.";
+              note.numberOfLines = 0;
+              note.textColor = [UIColor colorWithWhite:0.8 alpha:1.0];
+              note.textAlignment = NSTextAlignmentCenter;
+              [stack addArrangedSubview:note];
+              return;
+            }
+
+            const std::vector<std::string> cfg = SvrReadConfig();
+
+            // Resolution: the three keys the in-game "RENDER RESOLUTION" row sets together.
+            {
+              const int max_scale = std::atoi(SvrGet(cfg, "native_max_scale", "1").c_str());
+              const double res = std::atof(SvrGet(cfg, "native_render_scale", "1").c_str());
+              const int height = std::atoi(SvrGet(cfg, "native_scene_height", "0").c_str());
+              NSInteger current = UISegmentedControlNoSegment;
+              for (NSInteger i = 0; i < 5; ++i) {
+                if (kSvrScales[i].max_scale == max_scale && std::fabs(kSvrScales[i].res - res) < 0.01 &&
+                    kSvrScales[i].height == height) {
+                  current = i;
+                }
+              }
+              [stack addArrangedSubview:SvrRow(@"Resolution", SvrSegment(@[ @"360p", @"480p", @"720p", @"900p", @"1080p" ], current,
+                                                                         ^(NSInteger i) {
+                if (i < 0 || i > 4) return;
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "%.4f", kSvrScales[i].res);
+                SvrSet("native_max_scale", std::to_string(kSvrScales[i].max_scale));
+                SvrSet("native_render_scale", buf);
+                SvrSet("native_scene_height", std::to_string(kSvrScales[i].height));
+              }))];
+            }
+
+            // Texture quality
+            {
+              const std::string q = SvrGet(cfg, "native_texture_quality", "high");
+              NSInteger current = 0;
+              for (NSInteger i = 0; i < 3; ++i) {
+                if (q == kSvrTextureQualities[i]) current = i;
+              }
+              [stack addArrangedSubview:SvrRow(@"Textures", SvrSegment(@[ @"High", @"Medium", @"Low" ], current, ^(NSInteger i) {
+                if (i < 0 || i > 2) return;
+                SvrSet("native_texture_quality", std::string("\"") + kSvrTextureQualities[i] + "\"");
+              }))];
+            }
+
+            // Anti-aliasing: native_aa 1 (off), 2x, 3x, 4x; native_2x_msaa follows.
+            {
+              int aa = std::atoi(SvrGet(cfg, "native_aa", "0").c_str());
+              if (aa < 1 || aa > 4) aa = SvrGet(cfg, "native_2x_msaa", "true") == "false" ? 1 : 2;
+              [stack addArrangedSubview:SvrRow(@"Anti-aliasing", SvrSegment(@[ @"Off", @"2x", @"3x", @"4x" ], aa - 1,
+                                                                            ^(NSInteger i) {
+                if (i < 0 || i > 3) return;
+                const int value = static_cast<int>(i) + 1;
+                SvrSet("native_aa", std::to_string(value));
+                SvrSet("native_2x_msaa", value >= 2 ? "true" : "false");
+              }))];
+            }
+
+            // Frame rate
+            {
+              const int fps = std::atoi(SvrGet(cfg, "frame_rate", "60").c_str());
+              [stack addArrangedSubview:SvrRow(@"Frame rate", SvrSegment(@[ @"30", @"60" ], fps == 30 ? 0 : 1, ^(NSInteger i) {
+                SvrSet("frame_rate", i == 0 ? "30" : "60");
+              }))];
+            }
+
+            // On / off options
+            [stack addArrangedSubview:SvrRow(@"Soft filter", SvrToggle(SvrGet(cfg, "soft_filter", "false") == "true", ^(BOOL on) {
+              SvrSet("soft_filter", on ? "true" : "false");
+            }))];
+            [stack addArrangedSubview:SvrRow(@"Motion blur", SvrToggle(SvrGet(cfg, "motion_blur", "true") == "true", ^(BOOL on) {
+              SvrSet("motion_blur", on ? "true" : "false");
+            }))];
+            [stack addArrangedSubview:SvrRow(@"Depth of field", SvrToggle(SvrGet(cfg, "depth_of_field", "true") == "true", ^(BOOL on) {
+              SvrSet("depth_of_field", on ? "true" : "false");
+            }))];
+            [stack addArrangedSubview:SvrRow(@"Crowd", SvrToggle(SvrGet(cfg, "arena_crowd", "on") != "off", ^(BOOL on) {
+              SvrSet("arena_crowd", on ? "\"on\"" : "\"off\"");
+            }))];
+            [stack addArrangedSubview:SvrRow(@"Touch controls", SvrToggle(SvrGet(cfg, "touch_controls", "true") == "true", ^(BOOL on) {
+              SvrSet("touch_controls", on ? "true" : "false");
+            }))];
+          }
+
+          - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+            return UIInterfaceOrientationMaskLandscape;
+          }
+
+          - (BOOL)prefersStatusBarHidden {
+            return YES;
+          }
+
+          @end
+
+          // ---- the launcher screen ----
 
           @interface SvrLauncherViewController : UIViewController
           @property(nonatomic, copy) void (^onPlay)(void);
@@ -494,9 +783,21 @@ jobs:
               if (strongSelf && strongSelf.onPlay) strongSelf.onPlay();
             }] forControlEvents:UIControlEventTouchUpInside];
 
-            UIStackView* stack = [[UIStackView alloc] initWithArrangedSubviews:@[ title, sub, status, play ]];
+            UIButtonConfiguration* settingsCfg = [UIButtonConfiguration tintedButtonConfiguration];
+            settingsCfg.title = @"SETTINGS";
+            settingsCfg.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+            UIButton* settings = [UIButton buttonWithConfiguration:settingsCfg primaryAction:nil];
+            [settings addAction:[UIAction actionWithHandler:^(__kindof UIAction* action) {
+              SvrLauncherViewController* strongSelf = weakSelf;
+              if (!strongSelf) return;
+              SvrSettingsViewController* page = [[SvrSettingsViewController alloc] init];
+              page.modalPresentationStyle = UIModalPresentationFullScreen;
+              [strongSelf presentViewController:page animated:YES completion:nil];
+            }] forControlEvents:UIControlEventTouchUpInside];
+
+            UIStackView* stack = [[UIStackView alloc] initWithArrangedSubviews:@[ title, sub, status, play, settings ]];
             stack.axis = UILayoutConstraintAxisVertical;
-            stack.spacing = 18.0;
+            stack.spacing = 16.0;
             stack.alignment = UIStackViewAlignmentCenter;
             stack.translatesAutoresizingMaskIntoConstraints = NO;
             [self.view addSubview:stack];
@@ -505,6 +806,7 @@ jobs:
               [stack.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
               [stack.widthAnchor constraintLessThanOrEqualToAnchor:self.view.widthAnchor multiplier:0.9],
               [play.widthAnchor constraintEqualToConstant:260.0],
+              [settings.widthAnchor constraintEqualToConstant:260.0],
             ]];
           }
 
@@ -714,6 +1016,14 @@ jobs:
             <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
             <key>MinimumOSVersion</key><string>17.0</string>
             <key>UIDeviceFamily</key><array><integer>1</integer></array>
+            <key>CFBundleIcons</key>
+            <dict>
+              <key>CFBundlePrimaryIcon</key>
+              <dict>
+                <key>CFBundleIconFiles</key>
+                <array><string>AppIcon60x60</string></array>
+              </dict>
+            </dict>
             <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
             <key>UISupportedInterfaceOrientations</key>
             <array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
@@ -727,6 +1037,16 @@ jobs:
           </plist>
           EOF
           plutil -lint "$APP/Info.plist"
+
+          # the home-screen icon: icon/icon.png from the repo, made into the two sizes iPhones use
+          if [ -f icon/icon.png ]; then
+            sips -s format jpeg icon/icon.png --out "$RUNNER_TEMP/icon.jpg" > /dev/null
+            sips -s format png -z 120 120 "$RUNNER_TEMP/icon.jpg" --out "$APP/AppIcon60x60@2x.png" > /dev/null
+            sips -s format png -z 180 180 "$RUNNER_TEMP/icon.jpg" --out "$APP/AppIcon60x60@3x.png" > /dev/null
+            echo "icon files:"; ls -l "$APP"/AppIcon60x60*
+          else
+            echo "NOTE: no icon/icon.png in the repo - the app keeps the blank icon."
+          fi
 
           # leftover references to the build machine would make the app fail at launch
           if otool -L "$APP/svr2011" "$FW"/*.dylib "$APP/vulkan/lib"/*.dylib | grep "/Users/"; then
