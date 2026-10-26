@@ -1713,7 +1713,70 @@ jobs:
               }
               std::fprintf(stderr, "[boot] launcher: Play pressed\n");
               window.hidden = YES;
+              // let UIKit finish hiding it before the game makes its own window (else the log fills with
+              // "Unbalanced calls to begin/end appearance transitions")
+              for (int i = 0; i < 6; ++i) {
+                [loop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+              }
               window.rootViewController = nil;
+            }
+          }
+
+          // An https request for the game's online client (the game has no TLS of its own on iPhone).
+          // `raw` gets a whole HTTP answer ("HTTP/1.1 200 OK", headers, blank line, body); false = no answer.
+          bool SvrIosHttpsRequest(const std::string& method, const std::string& url, const std::string& headerLines,
+                                  const std::string& body, std::string* raw) {
+            @autoreleasepool {
+              NSURL* u = [NSURL URLWithString:SvrNS(url)];
+              if (!u) return false;
+              NSMutableURLRequest* req = [NSMutableURLRequest requestWithURL:u
+                                                                 cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                             timeoutInterval:60.0];
+              req.HTTPMethod = SvrNS(method);
+              size_t at = 0;
+              while (at < headerLines.size()) {
+                size_t end = headerLines.find("\r\n", at);
+                if (end == std::string::npos) end = headerLines.size();
+                const std::string line = headerLines.substr(at, end - at);
+                at = end + 2;
+                const size_t colon = line.find(':');
+                if (colon == std::string::npos) continue;
+                const std::string name = SvrTrim(line.substr(0, colon));
+                if (strcasecmp(name.c_str(), "content-length") == 0 || strcasecmp(name.c_str(), "host") == 0) continue;
+                [req setValue:SvrNS(SvrTrim(line.substr(colon + 1))) forHTTPHeaderField:SvrNS(name)];
+              }
+              if (!body.empty()) req.HTTPBody = [NSData dataWithBytes:body.data() length:body.size()];
+
+              __block NSData* resultData = nil;
+              __block NSHTTPURLResponse* resultResponse = nil;
+              dispatch_semaphore_t done = dispatch_semaphore_create(0);
+              [[[NSURLSession sharedSession]
+                  dataTaskWithRequest:req
+                    completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+                      if (!error && [response isKindOfClass:[NSHTTPURLResponse class]]) {
+                        resultData = data;
+                        resultResponse = (NSHTTPURLResponse*)response;
+                      }
+                      dispatch_semaphore_signal(done);
+                    }] resume];
+              dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+              if (!resultResponse) return false;
+
+              std::string out = "HTTP/1.1 " + std::to_string(static_cast<long>(resultResponse.statusCode)) + " OK\r\n";
+              for (id key in resultResponse.allHeaderFields) {
+                const std::string name = SvrStr(key);
+                // (the body arrives whole and already decoded, so these three would be wrong)
+                if (name.empty() || strcasecmp(name.c_str(), "content-length") == 0 ||
+                    strcasecmp(name.c_str(), "transfer-encoding") == 0 || strcasecmp(name.c_str(), "content-encoding") == 0) {
+                  continue;
+                }
+                out += name + ": " + SvrStd([NSString stringWithFormat:@"%@", resultResponse.allHeaderFields[key]]) + "\r\n";
+              }
+              const size_t length = resultData ? static_cast<size_t>(resultData.length) : 0;
+              out += "Content-Length: " + std::to_string(length) + "\r\n\r\n";
+              if (length > 0) out.append(static_cast<const char*>(resultData.bytes), length);
+              *raw = out;
+              return true;
             }
           }
           EOF
@@ -1748,6 +1811,38 @@ jobs:
           tail -n 6 port-src/port/CMakeLists.txt
           test -f port-src/port/src/ios_launcher.mm
           grep -q "SvrIosLauncherShow();" sdk/src/ui/windowed_app_main_sdl.cpp
+
+      - name: iOS online (the game's https requests go through the system)
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          p = "port-src/port/src/online_net.cpp"
+          s = open(p).read()
+
+          a = '#include <rex/logging.h>\n\nREXCVAR_DEFINE_STRING(online_token,'
+          assert s.count(a) == 1, "include anchor %d" % s.count(a)
+          s = s.replace(a, '#include <rex/logging.h>\n\n'
+                           '#if defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__)\n'
+                           '// ios_launcher.mm: an https request through the system; false when there was no answer.\n'
+                           'bool SvrIosHttpsRequest(const std::string& method, const std::string& url,\n'
+                           '                        const std::string& header_lines, const std::string& body, std::string* raw);\n'
+                           '#endif\n\nREXCVAR_DEFINE_STRING(online_token,')
+
+          b = '#if defined(__ANDROID__)\n    return BridgeRequest(method, full_url, headers, body);\n#else\n'
+          assert s.count(b) == 1, "request anchor %d" % s.count(b)
+          s = s.replace(b, '#if defined(__ANDROID__)\n    return BridgeRequest(method, full_url, headers, body);\n'
+                           '#elif defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__)\n'
+                           '    std::string header_lines;\n'
+                           '    for (const auto& h : headers) header_lines += h.first + ": " + h.second + "\\r\\n";\n'
+                           '    std::string raw;\n'
+                           '    if (!SvrIosHttpsRequest(method, full_url, header_lines, body, &raw)) return std::nullopt;\n'
+                           '    return ParseRaw(raw);\n'
+                           '#else\n')
+          open(p, "w").write(s)
+          PYEOF
+          echo "---- online_net.cpp edits ----"
+          grep -n -B1 -A7 "SvrIosHttpsRequest" port-src/port/src/online_net.cpp
+          grep -q "return ParseRaw(raw);" port-src/port/src/online_net.cpp
 
       - name: Put the generated code in place, and stop codegen re-running
         run: |
