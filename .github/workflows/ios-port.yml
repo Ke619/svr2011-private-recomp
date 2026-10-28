@@ -1481,6 +1481,8 @@ jobs:
             UIButton* _installBtn;
             UIButton* _cancelBtn;
             UIStackView* _files;
+            NSString* _signature;
+            NSTimer* _timer;
           }
 
           - (instancetype)init {
@@ -1505,6 +1507,18 @@ jobs:
             _files.axis = UILayoutConstraintAxisVertical;
             _files.spacing = 10.0;
             [stack addArrangedSubview:_files];
+            [stack addArrangedSubview:SvrButton(@"Refresh the list", NO, ^{
+              [weakSelf refreshFiles:YES];
+            })];
+            // (the list follows the folder by itself while this page is on screen)
+            _timer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer* timer) {
+              SvrInstallPage* s = weakSelf;
+              if (!s) {
+                [timer invalidate];
+                return;
+              }
+              if (s.view.window && !s.busy) [s refreshFiles:NO];
+            }];
             _installBtn = SvrButton(@"Or pick the disc image with the Files app…", NO, ^{
               [weakSelf pickImage];
             });
@@ -1530,10 +1544,22 @@ jobs:
             const BOOL installed = SvrFileExists(dest + "/default.xex");
             _state.text = [NSString stringWithFormat:@"%@ (%@ free).", installed ? @"Installed in the game folder" : @"Not installed yet",
                                                      SvrHuman(SvrFreeBytes(dest))];
-            for (UIView* v in [_files.arrangedSubviews copy]) [v removeFromSuperview];
+            [self refreshFiles:YES];
+          }
+
+          // The Import folder's files, each with Install and Delete (rebuilt only when the folder changed).
+          - (void)refreshFiles:(BOOL)force {
             const std::vector<SvrImportFile> found = SvrImportFiles();
+            NSMutableString* signature = [NSMutableString string];
+            for (const SvrImportFile& f : found) {
+              [signature appendFormat:@"%s:%llu;", f.name.c_str(), static_cast<unsigned long long>(f.size)];
+            }
+            if (!force && _signature && [_signature isEqualToString:signature]) return;
+            _signature = signature;
+            for (UIView* v in [_files.arrangedSubviews copy]) [v removeFromSuperview];
             if (found.empty()) {
-              [_files addArrangedSubview:SvrLabel(@"Nothing in the Import folder yet.", 14.0, SVR_DIM, NO)];
+              [_files addArrangedSubview:SvrLabel(@"Nothing in the Import folder yet. Copy your disc image there with the Files app: it shows up here by itself, with an Install button next to it.",
+                                                  14.0, SVR_DIM, NO)];
             }
             __weak SvrInstallPage* weakSelf = self;
             for (const SvrImportFile& f : found) {
@@ -2008,6 +2034,8 @@ jobs:
           @implementation SvrDlcPage {
             UILabel* _status;
             UIStackView* _list;
+            UILabel* _importInfo;
+            NSTimer* _timer;
             UIButton* _importBtn;
             UIButton* _filesBtn;
             UIButton* _folderBtn;
@@ -2030,10 +2058,20 @@ jobs:
             importPath.lineBreakMode = NSLineBreakByCharWrapping;
             importPath.font = [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightRegular];
             [stack addArrangedSubview:importPath];
+            _importInfo = SvrLabel(@"", 13.0, SVR_DIM, NO);
+            [stack addArrangedSubview:_importInfo];
             _importBtn = SvrButton(@"Add everything from the Import folder", YES, ^{
               [weakSelf addImport];
             });
             [stack addArrangedSubview:_importBtn];
+            _timer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer* timer) {
+              SvrDlcPage* s = weakSelf;
+              if (!s) {
+                [timer invalidate];
+                return;
+              }
+              if (s.view.window && !s.busy) [s updateImportInfo];
+            }];
             _filesBtn = SvrButton(@"Or pick files with the Files app…", NO, ^{
               [weakSelf pick:NO];
             });
@@ -2056,7 +2094,18 @@ jobs:
             return self;
           }
 
+          - (void)updateImportInfo {
+            const std::vector<SvrImportFile> found = SvrImportFiles();
+            uint64_t total = 0;
+            for (const SvrImportFile& f : found) total += f.size;
+            _importInfo.text = found.empty()
+                ? @"The Import folder is empty."
+                : [NSString stringWithFormat:@"Import folder: %lu file%@ (%@).", static_cast<unsigned long>(found.size()),
+                                             found.size() == 1 ? @"" : @"s", SvrHuman(total)];
+          }
+
           - (void)refresh {
+            [self updateImportInfo];
             for (UIView* v in [_list.arrangedSubviews copy]) [v removeFromSuperview];
             const std::vector<std::string> names = SvrDlcList();
             if (names.empty()) {
