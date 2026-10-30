@@ -438,6 +438,7 @@ jobs:
           #include <ctime>
           #include <functional>
           #include <map>
+          #include <sstream>
           #include <string>
           #include <vector>
           #include <dirent.h>
@@ -2354,9 +2355,53 @@ jobs:
             return ok;
           }
 
+          // A superstar mod's move pack (<mod>/moves/pack.txt, or <mod>/pack.txt): every "motion" and "pacentry"
+          // line names a file in the pack's folder; the game reports a missing one only in its log, and the
+          // move then has no motion (it freezes in the ring). Counts the files and lists the missing ones.
+          struct SvrPackCheck {
+            bool hasPack = false;
+            int total = 0;
+            int missing = 0;
+            std::vector<std::string> examples;  // the first few missing files
+          };
+
+          static SvrPackCheck SvrMovePackCheck(const std::string& modDir) {
+            SvrPackCheck r;
+            for (const std::string& dir : {modDir + "/moves", modDir}) {
+              std::ifstream f(dir + "/pack.txt");
+              if (!f) continue;
+              r.hasPack = true;
+              for (std::string line; std::getline(f, line);) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                std::istringstream in(line);
+                std::string kind, file;
+                in >> kind;
+                if (kind == "motion") {
+                  std::string pac, path, hdr;
+                  unsigned id = 0, x = 0, y = 0, frames = 0;
+                  in >> pac >> path >> id >> x >> y >> frames >> file >> hdr;
+                } else if (kind == "pacentry") {
+                  std::string pac, group, name;
+                  in >> pac >> group >> name >> file;
+                } else {
+                  continue;
+                }
+                if (file.empty()) continue;
+                r.total++;
+                struct stat st;
+                if (stat((dir + "/" + file).c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+                  r.missing++;
+                  if (r.examples.size() < 3) r.examples.push_back(file);
+                }
+              }
+              break;  // (the first folder with a pack.txt is the pack, as the game reads it)
+            }
+            return r;
+          }
+
           // Installs a .svrmod (a zip with manifest.txt and the mod's files) into Mods/<kind>/<id>.
           // Returns "" (and the mod's name in *name) or the reason it was refused.
-          static std::string SvrModInstall(const std::string& zipPath, std::string* name) {
+          static std::string SvrModInstall(const std::string& zipPath, std::string* name, std::string* warning = nullptr) {
             namespace fs = std::filesystem;
             const int fd = open(zipPath.c_str(), O_RDONLY);
             if (fd < 0) return "can't read it";
@@ -2454,6 +2499,14 @@ jobs:
               std::ofstream(dest + "/.installed") << static_cast<long long>(time(nullptr)) * 1000;
             }
             *name = m.count("name") && !m["name"].empty() ? m["name"] : id;
+            if (warning) {
+              const SvrPackCheck pack = SvrMovePackCheck(dest);
+              if (pack.missing > 0) {
+                *warning = std::to_string(pack.missing) + " of " + std::to_string(pack.total) +
+                           " move files are missing from the mod (for example " + pack.examples[0] +
+                           "): moves that use them will freeze in the ring";
+              }
+            }
             return "";
           }
 
@@ -2497,6 +2550,14 @@ jobs:
                   info.hint += ", " + std::to_string(static_cast<unsigned long long>(st.st_size) / 1048576) + " MB";
                 }
                 info.enabled = stat((path + "/disabled").c_str(), &st) != 0;
+                if (std::string(k.type) == "superstar") {
+                  const SvrPackCheck pack = SvrMovePackCheck(path);
+                  if (pack.hasPack) {
+                    info.hint += pack.missing > 0 ? ", MOVES: " + std::to_string(pack.missing) + " of " + std::to_string(pack.total) +
+                                                        " files MISSING (e.g. " + pack.examples[0] + ")"
+                                                  : ", moves: " + std::to_string(pack.total) + " files ok";
+                  }
+                }
                 out.push_back(info);
               }
             }
@@ -2664,10 +2725,11 @@ jobs:
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
               std::vector<std::string> ok, failed;
               for (const std::string& f : files) {
-                std::string name;
-                const std::string error = SvrModInstall(SvrImportDir() + "/" + f, &name);
+                std::string name, warning;
+                const std::string error = SvrModInstall(SvrImportDir() + "/" + f, &name, &warning);
                 if (error.empty()) {
                   ok.push_back(name);
+                  if (!warning.empty()) failed.push_back(name + " installed, but " + warning);
                 } else {
                   failed.push_back(f + " - " + error);
                 }
@@ -2687,7 +2749,7 @@ jobs:
               for (const std::string& n : ok) [names addObject:SvrNS(n)];
               [text appendFormat:@"Installed: %@. They work from the next game start.", [names componentsJoinedByString:@", "]];
             }
-            for (const std::string& f : failed) [text appendFormat:@"%@Not installed: %@", text.length ? @"\n" : @"", SvrNS(f)];
+            for (const std::string& f : failed) [text appendFormat:@"%@%@", text.length ? @"\n" : @"", SvrNS(f)];
             _status.text = text;
             [self refresh];
           }
